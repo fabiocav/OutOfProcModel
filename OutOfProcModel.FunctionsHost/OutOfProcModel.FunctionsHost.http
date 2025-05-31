@@ -1,0 +1,6 @@
+@OutOfProcModel.FunctionsHost_HostAddress = http://localhost:5145
+
+GET {{OutOfProcModel.FunctionsHost_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

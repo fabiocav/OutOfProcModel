@@ -1,27 +1,27 @@
-﻿// See https://aka.ms/new-console-template for more information
+﻿//using Microsoft.Extensions.DependencyInjection;
+//using Microsoft.Extensions.Hosting;
+//using OutOfProcModel.Abstractions.ControlPlane;
+//using OutOfProcModel.Mock;
 
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using OutOfProcModel.Abstractions.Core;
-using OutOfProcModel.Abstractions.Worker;
-using OutOfProcModel.Mock;
-using OutOfProcModel.Workers;
+//// Build DI container:
+//var builder = Host.CreateApplicationBuilder();
 
-// Build DI container:
-var builder = new HostApplicationBuilder();
 
-builder.Services.AddSingleton<IWorkerManager, WorkerManager>();
-builder.Services.AddSingleton<IWorkerResolver, DefaultWorkerResolver>();
-builder.Services.AddSingleton<IEventProcessor, WorkerEventProcessor>();
-builder.Services.AddSingleton<IWorkerFactory, DefaultWorkerFactory>();
-builder.Services.AddHostedService<ConsoleMockListener>();
-builder.Services.AddHostedService<EventGenerator>();
+//builder.Services.AddSingleton<MockWorkerFactory>();
 
-var host = builder.Build();
+//// Acts like an external worker and external event source
+//builder.Services.AddHostedService<ConsoleMockListener>();
 
-host.Start();
+//// Worker controller
+//builder.Services.AddSingleton<DefaultWorkerController>();
+//builder.Services.AddHostedService(s => s.GetRequiredService<DefaultWorkerController>());
+//builder.Services.AddSingleton<IWorkerController>(s => s.GetRequiredService<DefaultWorkerController>());
 
-await host.WaitForShutdownAsync();
+//var host = builder.Build();
+
+//host.Start();
+
+//await host.WaitForShutdownAsync();
 // Invocation flow:
 // WebJobs -> Invoker -> EventProcessor.ProcessEvent(context)
 

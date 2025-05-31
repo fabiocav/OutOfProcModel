@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <Sdk Name="Aspire.AppHost.Sdk" Version="9.0.0" />
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsAspireHost>true</IsAspireHost>
+    <UserSecretsId>01b82691-c910-4dd9-bca1-24f90fd2b00d</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Aspire.Hosting.AppHost" Version="9.3.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\OutOfProcModel.Blazor\OutOfProcModel.Blazor.csproj" />
+    <ProjectReference Include="..\OutOfProcModel.FunctionsHost\OutOfProcModel.FunctionsHost.csproj" />
+    <ProjectReference Include="..\OutOfProcModel.WorkerController\OutOfProcModel.WorkerController.csproj" />
+    <ProjectReference Include="..\OutOfProcModel\OutOfProcModel.csproj" />
+  </ItemGroup>
+
+</Project>
