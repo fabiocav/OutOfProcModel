@@ -1,7 +1,7 @@
-﻿using System.Text.Json;
-using System.Text.Json.Serialization;
-using OutOfProcModel.Abstractions.Worker;
+﻿using OutOfProcModel.Abstractions.Worker;
 using OutOfProcModel.WorkerController;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace OutOfProcModel.Abstractions.ControlPlane;
 
@@ -57,7 +57,7 @@ public class DefaultWorkerController(MockWorkerFactory workerFactory, ILogger<De
         {
             var workerId = $"w_{Guid.NewGuid().ToString()[..8]}";
 
-            var workerState = new WorkerState(context.ApplicationId, context.ApplicationVersion, workerId, environment);
+            var workerState = new WorkerState(context.ApplicationId, context.ApplicationVersion, workerId, environment, []);
             workerStateMap.TryAdd(workerState.WorkerId, workerState);
             await StartNewWorkerAsync(workerState);
         }
@@ -70,7 +70,7 @@ public class DefaultWorkerController(MockWorkerFactory workerFactory, ILogger<De
         var newWorker = _workerFactory.CreateWorker(workerState);
         await newWorker.StartAsync();
 
-        await UpdateWorkerStateAsync(workerState.ApplicationId, workerState.WorkerId, workerState.RuntimeEnvironment.IsPlaceholder ? WorkerStatus.RunningAsPlaceholder : WorkerStatus.Running);
+        await UpdateWorkerStateAsync(workerState.ApplicationId, workerState.WorkerId, WorkerStatus.Running);
     }
 
     public bool IncrementWorkerTarget(ApplicationContext context, RuntimeEnvironment environment)

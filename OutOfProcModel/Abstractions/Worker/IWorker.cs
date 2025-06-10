@@ -2,7 +2,7 @@
 
 namespace OutOfProcModel.Abstractions.Worker;
 
-public interface IInvocationHandler
+public interface IWorker
 {
     public string WorkerId { get; }
 
@@ -11,13 +11,15 @@ public interface IInvocationHandler
     string ApplicationVersion { get; }
 
     // implementation detail?
-    // IWorkerChannel Channel { get; }
-
-    // implementation detail?
     IEnumerable<string> Capabilities { get; }
+
+    WorkerStatus Status { get; }
 
     // would messages from grpc call this also?
     ValueTask<InvocationResult> ProcessEvent(InvocationContext context);
+
+    // Returns when all in-flight invocations have completed (or timeout is hit)
+    Task DrainAsync(TimeSpan timeout);
 }
 
 public enum WorkerStatus
@@ -25,8 +27,7 @@ public enum WorkerStatus
     None = 0,
     Created = 1,
     Initializing = 2,
-    RunningAsPlaceholder = 3,
-    Running = 4,
-    Draining = 5,
-    Stopped = 6
+    Running = 3,
+    Draining = 4,
+    Stopped = 5
 }

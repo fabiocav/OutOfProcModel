@@ -24,7 +24,7 @@ builder.Services.AddSingleton<IJobHostManager>(s => s.GetRequiredService<JobHost
 builder.Services.AddSingleton<IServiceCollection>(builder.Services);
 
 // This reaches into current JobHost to pull out current HandlerManager
-builder.Services.AddSingleton<IActiveInvocationHandlerManagerProvider, DefaultActiveInvocationHandlerManagerProvider>();
+builder.Services.AddSingleton<IActiveWorkerManagerProvider, DefaultActiveWorkerManagerProvider>();
 
 builder.Services.AddOptions<KestrelServerOptions>()
 .Configure<IConfiguration>((options, config) =>

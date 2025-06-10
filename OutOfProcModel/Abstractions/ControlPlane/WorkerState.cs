@@ -6,7 +6,7 @@ public class WorkerState
 {
     private WorkerStatus _status = WorkerStatus.None;
 
-    public WorkerState(string applicationId, string applicationVersion, string workerId, RuntimeEnvironment runtimeEnvironment)
+    public WorkerState(string applicationId, string applicationVersion, string workerId, RuntimeEnvironment runtimeEnvironment, IEnumerable<string> capabilities)
     {
         WorkerId = workerId;
         ApplicationId = applicationId;
@@ -18,17 +18,18 @@ public class WorkerState
         StateLastUpdated = now;
 
         RuntimeEnvironment = runtimeEnvironment;
+        Capabilities = capabilities;
     }
 
     public string WorkerId { get; }
 
-    public string ApplicationId { get; set; }
+    public string ApplicationId { get; }
 
-    public string ApplicationVersion { get; set; }
+    public string ApplicationVersion { get; }
 
-    public string[] Capabilities { get; set; } = [];
+    public IEnumerable<string> Capabilities { get; }
 
-    public RuntimeEnvironment RuntimeEnvironment { get; set; }
+    public RuntimeEnvironment RuntimeEnvironment { get; }
 
     public WorkerStatus Status
     {
@@ -49,5 +50,19 @@ public class WorkerState
 
     public DateTimeOffset Created { get; private set; }
 
-    public DateTimeOffset LastHeartbeat { get; set; }
+    public DateTimeOffset LastHeartbeat { get; private set; }
+
+    public WorkerState Specialize(string applicationId, string applicationVersion, IEnumerable<string> capabilities)
+    {
+        // Clone the current state with only relevant properties changed
+        var newRuntimeEnvironment = new RuntimeEnvironment(RuntimeEnvironment.Runtime, RuntimeEnvironment.Version, RuntimeEnvironment.Architecture, isPlaceholder: false);
+        var newState = new WorkerState(applicationId, applicationVersion, WorkerId, newRuntimeEnvironment, capabilities)
+        {
+            Status = Status,
+            StateLastUpdated = StateLastUpdated,
+            Created = Created,
+            LastHeartbeat = LastHeartbeat
+        };
+        return newState;
+    }
 }

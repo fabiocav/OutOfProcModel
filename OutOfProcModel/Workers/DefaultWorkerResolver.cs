@@ -2,14 +2,14 @@
 
 namespace OutOfProcModel.Workers;
 
-public class DefaultWorkerResolver(IInvocationHandlerManager workerManager) : IHandlerResolver
+public class DefaultWorkerResolver(IWorkerManager workerManager) : IWorkerResolver
 {
     private int _lastWorkerIndex = -1;
     private readonly Lock _lock = new();
 
-    public IInvocationHandler? ResolveHandler(string context)
+    public IWorker? ResolveWorker(string context)
     {
-        var workers = workerManager.GetHandlers(context)
+        var workers = workerManager.GetWorkers()
             .ToList();
 
         if (workers.Count == 0)

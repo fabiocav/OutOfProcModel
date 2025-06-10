@@ -1,12 +1,13 @@
-﻿using System.Collections.Concurrent;
-using System.Text.Json;
-using Microsoft.Extensions.DependencyInjection;
+﻿using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using OpenTelemetry.Trace;
 using OutOfProcModel.Abstractions.Core;
 using OutOfProcModel.Abstractions.Worker;
+using OutOfProcModel.FunctionsHost.Grpc;
 using OutOfProcModel.Workers;
+using System.Collections.Concurrent;
+using System.Text.Json;
 
 namespace OutOfProcModel.Mock;
 
@@ -17,13 +18,13 @@ public class JobHostManager(IServiceCollection rootServices, IServiceProvider ro
     private readonly IServiceCollection _rootServices = rootServices ?? throw new ArgumentNullException(nameof(rootServices));
     private readonly ILogger<JobHostManager> _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
-    private readonly ConcurrentDictionary<string, IHost> _jobHosts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, JobHost> _jobHosts = new(StringComparer.OrdinalIgnoreCase);
 
-    public async Task<IHost> GetOrAddJobHostAsync(string applicationId, Func<JobHostStartContext> contextFactory, Action<IServiceCollection> configureServices)
+    public async Task<JobHost> GetOrAddJobHostAsync(string applicationId, Func<JobHostStartContext> contextFactory, Action<IServiceCollection> configureServices)
     {
-        var host = _jobHosts.GetOrAdd(applicationId, _ => BuildJobHost(contextFactory(), configureServices));
-        await host.StartAsync();
-        return host;
+        var jobHost = _jobHosts.GetOrAdd(applicationId, _ => new JobHost(BuildJobHost(contextFactory(), configureServices)));
+        await jobHost.StartAsync();
+        return jobHost;
     }
 
     private IHost BuildJobHost(JobHostStartContext context, Action<IServiceCollection> configureServices)
@@ -34,17 +35,41 @@ public class JobHostManager(IServiceCollection rootServices, IServiceProvider ro
            {
                // TODO: inject a MetadataProvider using the static details from context
                services.AddSingleton<IEventProcessor, WorkerEventProcessor>();
-               services.AddSingleton<IHandlerResolver, DefaultWorkerResolver>();
-               services.AddSingleton<IInvocationHandlerManager, DefaultInvocationHandlerManager>();
+               services.AddSingleton<IWorkerResolver, DefaultWorkerResolver>();
+               services.AddSingleton<IWorkerManager, DefaultWorkerManager>();
                configureServices(services);
            });
 
         return builder.Build();
     }
 
-    public Task<IHost?> GetJobHostAsync(string applicationId)
+    public Task<JobHost?> GetJobHostAsync(string applicationId)
     {
         return Task.FromResult(_jobHosts.TryGetValue(applicationId, out var host) ? host : null);
+    }
+
+    public Task RemoveJobHostAsync(string applicationId)
+    {
+        _jobHosts.Remove(applicationId, out _);
+        return Task.CompletedTask;
+    }
+
+    public async Task AssignWorkerAsync(WorkerCreationContext context)
+    {
+        var jobHost = await GetJobHostAsync(context.ApplicationId);
+        if (jobHost != null)
+        {
+            await jobHost.Services.GetRequiredService<IWorkerManager>().CreateWorkerAsync(context);
+        }
+    }
+
+    public async Task HandleMessageAsync(MessageFromWorker message)
+    {
+        var jobHost = await GetJobHostAsync(message.ApplicationId);
+        if (jobHost != null)
+        {
+            await jobHost.Services.GetRequiredService<MessageHandlerPipeline>().HandleMessage(message);
+        }
     }
 
     public async Task StopJobHostAsync(string applicationId)
@@ -57,7 +82,7 @@ public class JobHostManager(IServiceCollection rootServices, IServiceProvider ro
         }
     }
 
-    class Handler
+    class Worker
     {
         public string Id { get; set; } = string.Empty;
 
@@ -66,7 +91,7 @@ public class JobHostManager(IServiceCollection rootServices, IServiceProvider ro
 
     class AppState
     {
-        public List<Handler> Handlers { get; } = [];
+        public List<Worker> Workers { get; } = [];
     }
 
     public string GetState()
@@ -78,11 +103,11 @@ public class JobHostManager(IServiceCollection rootServices, IServiceProvider ro
             var appState = new AppState();
             appStates[applicationId] = appState;
 
-            var handlerManager = jobHost.Services.GetRequiredService<IInvocationHandlerManager>();
-            var handlers = handlerManager.GetHandlers(applicationId);
-            foreach (var handler in handlers)
+            var workerManager = jobHost.Services.GetRequiredService<IWorkerManager>();
+            var workers = workerManager.GetWorkers();
+            foreach (var worker in workers)
             {
-                appState.Handlers.Add(new Handler { Id = handler.WorkerId });
+                appState.Workers.Add(new Worker { Id = worker.WorkerId });
             }
         }
 
@@ -93,10 +118,15 @@ public class JobHostManager(IServiceCollection rootServices, IServiceProvider ro
 public interface IJobHostManager
 {
     // gets or starts a new JobHost for this specific applicationId
-    Task<IHost> GetOrAddJobHostAsync(string applicationId, Func<JobHostStartContext> contextFactory, Action<IServiceCollection> configureServices);
+    Task<JobHost> GetOrAddJobHostAsync(string applicationId, Func<JobHostStartContext> contextFactory, Action<IServiceCollection> configureServices);
 
-    Task<IHost?> GetJobHostAsync(string applicationId);
+    Task<JobHost?> GetJobHostAsync(string applicationId);
 
-    // stops the JobHost and all kills all connected workers
-    Task StopJobHostAsync(string applicationId);
+    Task RemoveJobHostAsync(string applicationId);
+
+    // Adds a worker to the appropriate JobHost for the context
+    Task AssignWorkerAsync(WorkerCreationContext context);
+
+    // Sends a message to the appropriate JobHost
+    Task HandleMessageAsync(MessageFromWorker message);
 }

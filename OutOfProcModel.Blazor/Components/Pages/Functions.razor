@@ -175,7 +175,7 @@
         Stopwatch sw = Stopwatch.StartNew();
         var result = await _functionsAdminService.InvokeAsync(new InvokeContext
         {
-            ApplicationId = _applicationId,
+            ApplicationId = _isPlaceholder ? _placeholderId : _applicationId,
             TriggerId = "HttpTrigger1",
             Data = "random_data"
         });
@@ -202,5 +202,7 @@
         controllerStatus = JsonSerializer.Deserialize<string>(controllerStatus)!;
 
         await _functionsAdminService.SpecializeApplicationAsync(new() { ApplicationContext = appContext, RuntimeEnvironment = runtimeEnvironment });
+
+        _isPlaceholder = false; // after specialization, we are no longer a placeholder
     }
 }

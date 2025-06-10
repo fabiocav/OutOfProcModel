@@ -3,13 +3,13 @@ using OutOfProcModel.Abstractions.Worker;
 
 namespace OutOfProcModel.Workers;
 
-public class WorkerEventProcessor(IHandlerResolver handlerResolver) : IEventProcessor
+public class WorkerEventProcessor(IWorkerResolver handlerResolver) : IEventProcessor
 {
-    private readonly IHandlerResolver _handlerResolver = handlerResolver;
+    private readonly IWorkerResolver _handlerResolver = handlerResolver;
 
     public async ValueTask<EventResult> ProcessEvent(EventContext context)
     {
-        var worker = _handlerResolver.ResolveHandler(context.ApplicationId);
+        var worker = _handlerResolver.ResolveWorker(context.ApplicationId);
 
         if (worker == null)
         {

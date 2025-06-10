@@ -1,9 +1,9 @@
-﻿using System.Threading.Channels;
-using Grpc.Core;
+﻿using Grpc.Core;
 using Grpc.Net.Client;
 using OutOfProcModel.Abstractions.ControlPlane;
 using OutOfProcModel.FunctionsHost.Grpc;
 using ProtoBuf.Grpc.Client;
+using System.Threading.Channels;
 
 namespace OutOfProcModel.WorkerController;
 
@@ -29,15 +29,15 @@ public class MockWorker(WorkerState workerState, IConfiguration configuration, I
         var http = GrpcChannel.ForAddress(address);
         var hostService = http.CreateGrpcService<IFunctionsHostGrpcService>();
 
-        // Create a channel for the worker
-        var channel = Channel.CreateUnbounded<FunctionsGrpcMessage>();
+        // Create a stream for the worker
+        var outgoing = Channel.CreateUnbounded<GrpcFromWorker>();
+        //var incoming = Channel.CreateUnbounded<GrpcToWorker>();
 
-        async IAsyncEnumerable<FunctionsGrpcMessage> GetStream(Channel<FunctionsGrpcMessage> channel)
+        async IAsyncEnumerable<GrpcFromWorker> GetStream(Channel<GrpcFromWorker> channel)
         {
-            // take any message written to this channel and send it back to the functions host
             while (await channel.Reader.WaitToReadAsync())
             {
-                if (channel.Reader.TryRead(out var message))
+                while (channel.Reader.TryRead(out var message))
                 {
                     yield return message;
                 }
@@ -45,7 +45,7 @@ public class MockWorker(WorkerState workerState, IConfiguration configuration, I
         }
 
         // Start the stream
-        channel.Writer.TryWrite(new FunctionsGrpcMessage
+        outgoing.Writer.TryWrite(new GrpcFromWorker
         {
             MessageType = FunctionsGrpcMessage.StartStream,
             Id = workerState.WorkerId,
@@ -63,12 +63,12 @@ public class MockWorker(WorkerState workerState, IConfiguration configuration, I
 
         try
         {
-            await foreach (var functionsGrpcMessage in hostService.StartStreamAsync(GetStream(channel)))
+            await foreach (var functionsGrpcMessage in hostService.StartStreamAsync(GetStream(outgoing)))
             {
                 switch (functionsGrpcMessage.MessageType)
                 {
                     case FunctionsGrpcMessage.MetadataRequest:
-                        channel.Writer.TryWrite(new FunctionsGrpcMessage
+                        outgoing.Writer.TryWrite(new GrpcFromWorker
                         {
                             MessageType = FunctionsGrpcMessage.MetadataResponse,
                             Id = workerState.WorkerId,
@@ -84,7 +84,7 @@ public class MockWorker(WorkerState workerState, IConfiguration configuration, I
                         var delay = Random.Shared.Next(100, 2000);
                         await Task.Delay(delay);
                         var invocationId = functionsGrpcMessage.Properties[FunctionsGrpcMessage.FunctionInvocationId];
-                        channel.Writer.TryWrite(new FunctionsGrpcMessage
+                        outgoing.Writer.TryWrite(new GrpcFromWorker
                         {
                             MessageType = FunctionsGrpcMessage.InvocationResponse,
                             Id = workerState.WorkerId,
@@ -96,26 +96,32 @@ public class MockWorker(WorkerState workerState, IConfiguration configuration, I
                         });
                         break;
                     case FunctionsGrpcMessage.EnvironmentReloadRequest:
+                        IEnumerable<string> capabilities = [];
+                        var newWorkerState = new WorkerState(functionsGrpcMessage.Properties["ApplicationId"], functionsGrpcMessage.Properties["ApplicationVersion"],
+                            workerState.WorkerId, workerState.RuntimeEnvironment, capabilities);
+                        workerState = newWorkerState;
                         workerState.RuntimeEnvironment.IsPlaceholder = false;
-                        workerState.ApplicationId = functionsGrpcMessage.Properties["ApplicationId"];
-                        workerState.ApplicationVersion = functionsGrpcMessage.Properties["ApplicationVersion"];
-
-                        channel.Writer.TryWrite(new FunctionsGrpcMessage
+                        outgoing.Writer.TryWrite(new GrpcFromWorker
                         {
                             MessageType = FunctionsGrpcMessage.EnvironmentReloadResponse,
                             Id = workerState.WorkerId,
                             Properties = new Dictionary<string, string>
                                 {
                                     {"ApplicationId", workerState.ApplicationId},
-                                    {"ApplicationVersion", workerState.ApplicationVersion}
+                                    {"ApplicationVersion", workerState.ApplicationVersion},
+                                    {"Runtime", workerState.RuntimeEnvironment.Runtime },
+                                    {"Version", workerState.RuntimeEnvironment.Version },
+                                    {"Architecture", workerState.RuntimeEnvironment.Architecture },
+                                    {"IsPlaceholder", workerState.RuntimeEnvironment.IsPlaceholder.ToString() },
+                                    {"Capabilities", "WorkerIndexingEnabled;HttpProxyEnabled" } // mock capabilities
                                 }
                         });
                         break;
                     case FunctionsGrpcMessage.ShutdownMessage:
                         _logger.LogInformation("Received shutdown message. {WorkerId} | {Environment}", workerState.WorkerId, workerState.RuntimeEnvironment);
                         // do anything needed to gracefully shutdown the worker
-                        channel.Writer.TryComplete();
-                        await channel.Reader.Completion;
+                        outgoing.Writer.TryComplete();
+                        await outgoing.Reader.Completion;
                         return;
                     default:
                         throw new InvalidOperationException();
