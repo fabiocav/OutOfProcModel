@@ -23,9 +23,4 @@ public class MessageHandlerPipeline
 
         return false;
     }
-
-    public void AddHandler(IMessageHandler handler)
-    {
-        _messageHandlers.Add(handler);
-    }
 }

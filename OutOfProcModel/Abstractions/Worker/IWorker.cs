@@ -1,20 +1,17 @@
 ﻿using OutOfProcModel.Abstractions.Core;
+using OutOfProcModel.Abstractions.Mock;
 
 namespace OutOfProcModel.Abstractions.Worker;
 
-public interface IWorker
+public interface IWorkerState
 {
-    public string WorkerId { get; }
-
-    string ApplicationId { get; }
-
-    string ApplicationVersion { get; }
-
-    // implementation detail?
-    IEnumerable<string> Capabilities { get; }
+    WorkerDefinition Definition { get; }
 
     WorkerStatus Status { get; }
+}
 
+public interface IWorker : IWorkerState
+{
     // would messages from grpc call this also?
     ValueTask<InvocationResult> ProcessEvent(InvocationContext context);
 
@@ -24,10 +21,12 @@ public interface IWorker
 
 public enum WorkerStatus
 {
-    None = 0,
-    Created = 1,
-    Initializing = 2,
+    Created = 0,
+    Initializing = 1,
+    Initialized = 2,
     Running = 3,
     Draining = 4,
-    Stopped = 5
+    Drained = 5,
+    Stopping = 6,
+    Stopped = 7
 }

@@ -1,26 +1,25 @@
 ﻿using Grpc.Core;
 using Grpc.Net.Client;
-using OutOfProcModel.Abstractions.ControlPlane;
-using OutOfProcModel.FunctionsHost.Grpc;
+using OutOfProcModel.Grpc.Abstractions;
 using ProtoBuf.Grpc.Client;
 using System.Threading.Channels;
 
 namespace OutOfProcModel.WorkerController;
 
-public class MockWorker(WorkerState workerState, IConfiguration configuration, ILogger<MockWorker> logger)
+internal class MockWorker(ControllerWorkerDefinition workerDef, IConfiguration configuration, ILogger<MockWorker> logger)
 {
-    private readonly WorkerState _workerState = workerState ?? throw new ArgumentNullException(nameof(workerState));
+    private readonly ControllerWorkerDefinition _workerDef = workerDef ?? throw new ArgumentNullException(nameof(workerDef));
     private readonly IConfiguration _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
     private readonly ILogger<MockWorker> _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
     public Task StartAsync()
     {
-        _ = StartNewWorkerAsync(_workerState);
+        _ = StartNewWorkerAsync(_workerDef);
         return Task.CompletedTask;
     }
 
     // This loop represents a single worker running
-    private async Task StartNewWorkerAsync(WorkerState workerState)
+    private async Task StartNewWorkerAsync(ControllerWorkerDefinition workerDef)
     {
         var hostUriPath = ConfigurationPath.Combine("services", "functionshost", "http", "0");
         var address = _configuration[hostUriPath];
@@ -48,15 +47,15 @@ public class MockWorker(WorkerState workerState, IConfiguration configuration, I
         outgoing.Writer.TryWrite(new GrpcFromWorker
         {
             MessageType = FunctionsGrpcMessage.StartStream,
-            Id = workerState.WorkerId,
+            Id = workerDef.WorkerId,
             Properties = new Dictionary<string, string>
                 {
-                    {"ApplicationId", workerState.ApplicationId },
-                    {"ApplicationVersion", workerState.ApplicationVersion },
-                    {"Runtime", workerState.RuntimeEnvironment.Runtime },
-                    {"Version", workerState.RuntimeEnvironment.Version },
-                    {"Architecture", workerState.RuntimeEnvironment.Architecture },
-                    {"IsPlaceholder", workerState.RuntimeEnvironment.IsPlaceholder.ToString() },
+                    {"ApplicationId", workerDef.ApplicationContext.ApplicationId },
+                    {"ApplicationVersion", workerDef.ApplicationContext.ApplicationVersion },
+                    {"Runtime", workerDef.RuntimeEnvironment.Runtime },
+                    {"Version", workerDef.RuntimeEnvironment.Version },
+                    {"Architecture", workerDef.RuntimeEnvironment.Architecture },
+                    {"IsPlaceholder", workerDef.RuntimeEnvironment.IsPlaceholder.ToString() },
                     {"Capabilities", "WorkerIndexingEnabled;HttpProxyEnabled" } // mock capabilities
                 }
         });
@@ -71,7 +70,7 @@ public class MockWorker(WorkerState workerState, IConfiguration configuration, I
                         outgoing.Writer.TryWrite(new GrpcFromWorker
                         {
                             MessageType = FunctionsGrpcMessage.MetadataResponse,
-                            Id = workerState.WorkerId,
+                            Id = workerDef.WorkerId,
                             Properties = new Dictionary<string, string>
                                 {
                                     { "HttpTrigger1", "random_metadata" },
@@ -87,7 +86,7 @@ public class MockWorker(WorkerState workerState, IConfiguration configuration, I
                         outgoing.Writer.TryWrite(new GrpcFromWorker
                         {
                             MessageType = FunctionsGrpcMessage.InvocationResponse,
-                            Id = workerState.WorkerId,
+                            Id = workerDef.WorkerId,
                             Properties = new Dictionary<string, string>
                                 {
                                     { FunctionsGrpcMessage.FunctionInvocationId, invocationId },
@@ -96,29 +95,26 @@ public class MockWorker(WorkerState workerState, IConfiguration configuration, I
                         });
                         break;
                     case FunctionsGrpcMessage.EnvironmentReloadRequest:
-                        IEnumerable<string> capabilities = [];
-                        var newWorkerState = new WorkerState(functionsGrpcMessage.Properties["ApplicationId"], functionsGrpcMessage.Properties["ApplicationVersion"],
-                            workerState.WorkerId, workerState.RuntimeEnvironment, capabilities);
-                        workerState = newWorkerState;
-                        workerState.RuntimeEnvironment.IsPlaceholder = false;
+                        workerDef = workerDef.Specialize(functionsGrpcMessage.Properties["ApplicationId"], functionsGrpcMessage.Properties["ApplicationVersion"]);
                         outgoing.Writer.TryWrite(new GrpcFromWorker
                         {
                             MessageType = FunctionsGrpcMessage.EnvironmentReloadResponse,
-                            Id = workerState.WorkerId,
+                            Id = workerDef.WorkerId,
                             Properties = new Dictionary<string, string>
                                 {
-                                    {"ApplicationId", workerState.ApplicationId},
-                                    {"ApplicationVersion", workerState.ApplicationVersion},
-                                    {"Runtime", workerState.RuntimeEnvironment.Runtime },
-                                    {"Version", workerState.RuntimeEnvironment.Version },
-                                    {"Architecture", workerState.RuntimeEnvironment.Architecture },
-                                    {"IsPlaceholder", workerState.RuntimeEnvironment.IsPlaceholder.ToString() },
+                                    {"ApplicationId", workerDef.ApplicationContext.ApplicationId},
+                                    {"ApplicationVersion", workerDef.ApplicationContext.ApplicationVersion},
+                                    {"WorkerId", workerDef.WorkerId},
+                                    {"Runtime", workerDef.RuntimeEnvironment.Runtime },
+                                    {"Version", workerDef.RuntimeEnvironment.Version },
+                                    {"Architecture", workerDef.RuntimeEnvironment.Architecture },
+                                    {"IsPlaceholder", workerDef.RuntimeEnvironment.IsPlaceholder.ToString() },
                                     {"Capabilities", "WorkerIndexingEnabled;HttpProxyEnabled" } // mock capabilities
                                 }
                         });
                         break;
                     case FunctionsGrpcMessage.ShutdownMessage:
-                        _logger.LogInformation("Received shutdown message. {WorkerId} | {Environment}", workerState.WorkerId, workerState.RuntimeEnvironment);
+                        _logger.LogInformation("Received shutdown message. {WorkerId} | {Environment}", workerDef.WorkerId, workerDef.RuntimeEnvironment);
                         // do anything needed to gracefully shutdown the worker
                         outgoing.Writer.TryComplete();
                         await outgoing.Reader.Completion;

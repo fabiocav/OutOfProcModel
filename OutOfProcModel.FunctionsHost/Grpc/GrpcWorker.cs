@@ -1,5 +1,7 @@
 ﻿using OutOfProcModel.Abstractions.Core;
+using OutOfProcModel.Abstractions.Mock;
 using OutOfProcModel.Abstractions.Worker;
+using OutOfProcModel.Grpc.Abstractions;
 using System.Collections.Concurrent;
 
 namespace OutOfProcModel.FunctionsHost.Grpc;
@@ -7,65 +9,97 @@ namespace OutOfProcModel.FunctionsHost.Grpc;
 internal class GrpcWorker : IWorker, IDisposable
 {
     private readonly ConcurrentDictionary<string, TaskCompletionSource<InvocationResult>> _executingInvocations = [];
+    private readonly Task _readLoopTask;
+    private readonly CancellationTokenSource _readLoopCancellationSource = new();
 
-    private readonly ILogger<GrpcWorker> _logger;
+    public GrpcWorker(WorkerDefinition workerDefinition, IWorkerChannel channel)
+    {
+        Definition = workerDefinition ?? throw new ArgumentNullException(nameof(workerDefinition));
+
+        _channel = channel;
+        _readLoopTask = StartReadLoopAsync(_readLoopCancellationSource.Token);
+    }
+
     private readonly IWorkerChannel _channel;
 
-    public GrpcWorker(string applicationId, string workerId, string version, IWorkerChannel channel, ILogger<GrpcWorker> logger)
-    {
-        WorkerId = workerId;
-        ApplicationId = applicationId;
-        ApplicationVersion = version;
-        _channel = channel;
-
-        _logger = logger;
-
-        _ = StartReadLoopAsync();
-    }
-
-    private async Task StartReadLoopAsync()
-    {
-        Status = WorkerStatus.Running;
-
-        await foreach (var message in _channel.ReadAsync())
-        {
-            var invocationId = message.Properties["FunctionInvocationId"];
-            if (_executingInvocations.TryRemove(invocationId, out TaskCompletionSource<InvocationResult>? tcs))
-            {
-                tcs.TrySetResult(new InvocationResult(invocationId, message.Properties["Result"]));
-            }
-        }
-    }
-
-    public string WorkerId { get; }
-
-    public string ApplicationId { get; }
-
-    public string ApplicationVersion { get; }
-
-    public IEnumerable<string> Capabilities { get; } = [];
+    public WorkerDefinition Definition { get; }
 
     public WorkerStatus Status { get; private set; } = WorkerStatus.Created;
 
-    public void Dispose()
+    private async Task StartReadLoopAsync(CancellationToken readLoopToken)
     {
-        // do more...
+        Status = WorkerStatus.Running;
+        try
+        {
+            await foreach (var message in _channel.ReadAsync(readLoopToken))
+            {
+                if (message.MessageType == FunctionsGrpcMessage.InvocationResponse)
+                {
+                    var invocationId = message.Properties["FunctionInvocationId"];
+                    if (_executingInvocations.TryRemove(invocationId, out TaskCompletionSource<InvocationResult>? tcs))
+                    {
+                        tcs.TrySetResult(new InvocationResult(invocationId, message.Properties["Result"]));
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // normal shutdown
+        }
+
+        // We'll never read from this again.
+        await _channel.DisconnectAsync();
     }
 
-    public async ValueTask<InvocationResult> ProcessEvent(InvocationContext context)
+    public ValueTask<InvocationResult> ProcessEvent(InvocationContext context)
     {
+        if (Status != WorkerStatus.Running)
+        {
+            throw new InvalidOperationException($"Worker {Definition.WorkerId} is not running. Current status: {Status}");
+        }
+
         TaskCompletionSource<InvocationResult> tcs = new();
         _executingInvocations.TryAdd(context.InvocationId, tcs);
 
-        await _channel.SendAsync(context);
-        return await tcs.Task;
+        var properties = new Dictionary<string, string>
+        {
+            { FunctionsGrpcMessage.FunctionInvocationId, context.InvocationId },
+            { "Data", context.Data }
+        };
+
+        _channel.TryWrite(new MessageToWorker(Definition.ApplicationId, FunctionsGrpcMessage.InvocationRequest, properties));
+        return new ValueTask<InvocationResult>(tcs.Task);
     }
 
-    public Task DrainAsync(TimeSpan timeout)
+    // Waits for invocations to complete
+    public async Task DrainAsync(TimeSpan timeout)
     {
+        // This worker is now removed from load-balancing and will not receive new invocations
         Status = WorkerStatus.Draining;
 
         var tasks = _executingInvocations.Select(p => p.Value.Task);
-        return Task.WhenAll(tasks); // todo -- some timeout stuff
+        await Task.WhenAll(tasks); // todo -- some timeout stuff
+
+        _readLoopCancellationSource.Cancel();
+        await _readLoopTask;
+
+        Status = WorkerStatus.Drained;
+    }
+
+    // Do not wait for invocations to complete
+    private async Task StopAsync()
+    {
+        Status = WorkerStatus.Stopping;
+
+        _readLoopCancellationSource.Cancel();
+        await _readLoopTask;
+
+        Status = WorkerStatus.Stopped;
+    }
+
+    public void Dispose()
+    {
+        StopAsync().GetAwaiter().GetResult();
     }
 }

@@ -12,14 +12,14 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Aspire.Hosting.AppHost" Version="9.3.0" />
+    <PackageReference Include="Aspire.Hosting.AppHost" Version="9.3.1" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\OutOfProcModel.Blazor\OutOfProcModel.Blazor.csproj" />
     <ProjectReference Include="..\OutOfProcModel.FunctionsHost\OutOfProcModel.FunctionsHost.csproj" />
     <ProjectReference Include="..\OutOfProcModel.WorkerController\OutOfProcModel.WorkerController.csproj" />
-    <ProjectReference Include="..\OutOfProcModel\OutOfProcModel.csproj" />
+    <ProjectReference Include="..\OutOfProcModel\OutOfProcModel.Abstractions.csproj" />
   </ItemGroup>
 
 </Project>

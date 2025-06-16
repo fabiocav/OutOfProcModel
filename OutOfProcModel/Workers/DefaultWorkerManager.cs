@@ -7,25 +7,43 @@ internal class DefaultWorkerManager : IWorkerManager, IDisposable
     // Dictionary mapping applicationId to a list of workers:
     private readonly IList<IWorker> _workers = [];
 
-    private IWorkerFactory _workerFactory;
-    private readonly IWorkerChannelFactory _workerChannelFactory;
+    private readonly IWorkerFactory _workerFactory;
 
-    public DefaultWorkerManager(IWorkerFactory workerFactory, IWorkerChannelFactory workerChannelFactory)
+    public DefaultWorkerManager(IWorkerFactory workerFactory)
     {
         _workerFactory = workerFactory;
-        _workerChannelFactory = workerChannelFactory;
     }
 
-    public async ValueTask CreateWorkerAsync(WorkerCreationContext workerCreationContext)
+    // Create a worker and return a way for callers to monitor its state
+    public async ValueTask<IWorkerState> CreateWorkerAsync(WorkerCreationContext workerCreationContext)
     {
         // this is JobHost-scoped, so ensure that we own lifetime of workers fully
         var worker = await _workerFactory.Create(workerCreationContext);
         _workers.Add(worker);
+        return worker;
     }
 
-    public bool RemoveWorker(IWorker worker)
+    /// <summary>
+    /// Removes the worker from load balancing...
+    /// </summary>
+    /// <param name="worker"></param>
+    /// <returns></returns>
+    public async Task<bool> RemoveWorkerAsync(string workerId)
     {
-        return _workers.Remove(worker);
+        var worker = _workers.FirstOrDefault(w => w.Definition.WorkerId == workerId);
+
+        if (worker == null)
+        {
+            return false; // Worker not found
+        }
+
+        _workers.Remove(worker);
+
+        await worker.DrainAsync(TimeSpan.FromSeconds(5));
+
+        (worker as IDisposable)?.Dispose();
+
+        return true;
     }
 
     public IReadOnlyCollection<IWorker> GetWorkers()

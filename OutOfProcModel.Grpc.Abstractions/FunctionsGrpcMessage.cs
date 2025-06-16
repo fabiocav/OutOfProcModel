@@ -1,7 +1,6 @@
 ﻿using ProtoBuf;
-using System.Threading.Channels;
 
-namespace OutOfProcModel.FunctionsHost.Grpc;
+namespace OutOfProcModel.Grpc.Abstractions;
 
 [ProtoContract]
 [ProtoInclude(100, typeof(GrpcToWorker))]
@@ -9,6 +8,7 @@ namespace OutOfProcModel.FunctionsHost.Grpc;
 public abstract class FunctionsGrpcMessage
 {
     public const string StartStream = "StartStream";
+    public const string HostDescription = "HostDescription";
     public const string MetadataRequest = "MetadataRequest";
     public const string MetadataResponse = "MetadataResponse";
     public const string InvocationRequest = "InvocationRequest";
@@ -26,7 +26,7 @@ public abstract class FunctionsGrpcMessage
     public string Id { get; set; } = string.Empty;
 
     [ProtoMember(3)]
-    public Dictionary<string, string> Properties { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    public IDictionary<string, string> Properties { get; set; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 }
 
 [ProtoContract]
@@ -34,11 +34,3 @@ public class GrpcToWorker : FunctionsGrpcMessage { }
 
 [ProtoContract]
 public class GrpcFromWorker : FunctionsGrpcMessage { }
-
-internal class WorkerGrpcStream
-{
-    public Channel<GrpcToWorker> Outgoing { get; set; } = Channel.CreateUnbounded<GrpcToWorker>();
-
-    public Channel<GrpcFromWorker> Incoming { get; set; } = Channel.CreateUnbounded<GrpcFromWorker>();
-
-}

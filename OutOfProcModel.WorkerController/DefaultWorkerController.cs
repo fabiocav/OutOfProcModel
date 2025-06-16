@@ -1,11 +1,10 @@
-﻿using OutOfProcModel.Abstractions.Worker;
-using OutOfProcModel.WorkerController;
+﻿using OutOfProcModel.WorkerController;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace OutOfProcModel.Abstractions.ControlPlane;
 
-public class DefaultWorkerController(MockWorkerFactory workerFactory, ILogger<DefaultWorkerController> logger) : IWorkerController
+internal class DefaultWorkerController(MockWorkerFactory workerFactory, ILogger<DefaultWorkerController> logger) : IWorkerController
 {
     private readonly ILogger<DefaultWorkerController> _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     private readonly MockWorkerFactory _workerFactory = workerFactory ?? throw new ArgumentNullException(nameof(workerFactory));
@@ -15,7 +14,7 @@ public class DefaultWorkerController(MockWorkerFactory workerFactory, ILogger<De
     private readonly Dictionary<ApplicationContext, Dictionary<RuntimeEnvironment, int>> _workerTargets = [];
 
     // For every ApplicationId, we track the current worker states by workerId.
-    private readonly Dictionary<string, Dictionary<string, WorkerState>> _workerStates = [];
+    private readonly Dictionary<string, Dictionary<string, ControllerWorkerState>> _workerStates = [];
 
     private async Task EvaluateStateAsync()
     {
@@ -33,7 +32,7 @@ public class DefaultWorkerController(MockWorkerFactory workerFactory, ILogger<De
                     _workerStates[context.ApplicationId] = workerStateMap;
                 }
 
-                var currentCount = workerStateMap.Values.Count(s => s.RuntimeEnvironment == environment && s.Status <= WorkerStatus.Running);
+                var currentCount = workerStateMap.Values.Count(s => s.Definition.RuntimeEnvironment == environment && s.Status <= ControllerWorkerStatus.Running);
                 if (currentCount < targetCount)
                 {
                     await CreateWorkerStatesAndStartWorkers(context, environment, workerStateMap);
@@ -53,24 +52,24 @@ public class DefaultWorkerController(MockWorkerFactory workerFactory, ILogger<De
             _logger.LogInformation("Worker evaluation completed. No more workers needed at this time.");
         }
 
-        async Task CreateWorkerStatesAndStartWorkers(ApplicationContext context, RuntimeEnvironment environment, IDictionary<string, WorkerState> workerStateMap)
+        async Task CreateWorkerStatesAndStartWorkers(ApplicationContext context, RuntimeEnvironment environment, IDictionary<string, ControllerWorkerState> workerStateMap)
         {
             var workerId = $"w_{Guid.NewGuid().ToString()[..8]}";
 
-            var workerState = new WorkerState(context.ApplicationId, context.ApplicationVersion, workerId, environment, []);
-            workerStateMap.TryAdd(workerState.WorkerId, workerState);
-            await StartNewWorkerAsync(workerState);
+            var workerDef = new ControllerWorkerDefinition(context, workerId, environment);
+            var workerState = new ControllerWorkerState(workerDef);
+
+            workerStateMap.TryAdd(workerState.Definition.WorkerId, workerState);
+            await StartNewWorkerAsync(workerDef);
         }
     }
 
-    private async Task StartNewWorkerAsync(WorkerState workerState)
+    private async Task StartNewWorkerAsync(ControllerWorkerDefinition workerDef)
     {
-        await UpdateWorkerStateAsync(workerState.ApplicationId, workerState.WorkerId, WorkerStatus.Created);
-
-        var newWorker = _workerFactory.CreateWorker(workerState);
+        var newWorker = _workerFactory.CreateWorker(workerDef);
         await newWorker.StartAsync();
 
-        await UpdateWorkerStateAsync(workerState.ApplicationId, workerState.WorkerId, WorkerStatus.Running);
+        await UpdateWorkerStateAsync(workerDef.ApplicationContext.ApplicationId, workerDef.WorkerId, ControllerWorkerStatus.Running);
     }
 
     public bool IncrementWorkerTarget(ApplicationContext context, RuntimeEnvironment environment)
@@ -141,7 +140,7 @@ public class DefaultWorkerController(MockWorkerFactory workerFactory, ILogger<De
         return true;
     }
 
-    public Task UpdateWorkerStateAsync(string applicationId, string workerId, WorkerStatus status)
+    public Task UpdateWorkerStateAsync(string applicationId, string workerId, ControllerWorkerStatus status)
     {
         if (!_workerStates.TryGetValue(applicationId, out var workerStates))
         {
@@ -156,7 +155,7 @@ public class DefaultWorkerController(MockWorkerFactory workerFactory, ILogger<De
         // now we know we've got something to update
         currentState.Status = status;
 
-        _logger.LogInformation($"Application '{applicationId}' updated worker state '{currentState.WorkerId}' to '{currentState.Status}'");
+        _logger.LogInformation($"Application '{applicationId}' updated worker state '{currentState.Definition.WorkerId}' to '{currentState.Status}'");
 
         _ = EvaluateStateAsync();
         return Task.CompletedTask;

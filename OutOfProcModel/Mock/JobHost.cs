@@ -7,6 +7,7 @@ namespace OutOfProcModel.Mock;
 public class JobHost : IHost
 {
     private readonly IHost _host;
+    private bool _isStarted = false;
 
     public JobHost(IHost host)
     {
@@ -15,6 +16,8 @@ public class JobHost : IHost
 
     public IServiceProvider Services => _host.Services;
 
+    public IWorkerManager WorkerManager => _host.Services.GetRequiredService<IWorkerManager>();
+
     public void Dispose()
     {
         _host.Dispose();
@@ -22,7 +25,13 @@ public class JobHost : IHost
 
     public Task StartAsync(CancellationToken cancellationToken = default)
     {
-        return _host.StartAsync(cancellationToken);
+        if (!_isStarted)
+        {
+            _isStarted = true;
+            return _host.StartAsync(cancellationToken);
+        }
+
+        return Task.CompletedTask;
     }
 
     public Task StopAsync(CancellationToken cancellationToken = default)

@@ -3,7 +3,7 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.13.35723.152
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OutOfProcModel", "OutOfProcModel\OutOfProcModel.csproj", "{95A42D77-D8E6-4BB3-9A61-DA251EDF5AC6}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OutOfProcModel.Abstractions", "OutOfProcModel\OutOfProcModel.Abstractions.csproj", "{95A42D77-D8E6-4BB3-9A61-DA251EDF5AC6}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OutOfProcModel.AppHost", "OutOfProcModel.AppHost\OutOfProcModel.AppHost.csproj", "{A04969EF-D8A2-4538-B160-6A404A4ED30C}"
 EndProject
@@ -14,6 +14,10 @@ EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OutOfProcModel.Blazor", "OutOfProcModel.Blazor\OutOfProcModel.Blazor.csproj", "{BBE614A3-2FE9-452E-9136-E66380A488D7}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OutOfProcModel.WorkerController", "OutOfProcModel.WorkerController\OutOfProcModel.WorkerController.csproj", "{C7968AAB-D770-4B15-980D-26CAC1130805}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OutOfProcModel.Grpc.Abstractions", "OutOfProcModel.Grpc.Abstractions\OutOfProcModel.Grpc.Abstractions.csproj", "{10F64856-430B-4180-8265-9FC77723078C}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Abstractions", "Abstractions", "{02EA681E-C7D8-13C7-8484-4AC65E1B71E8}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -45,9 +49,17 @@ Global
 		{C7968AAB-D770-4B15-980D-26CAC1130805}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{C7968AAB-D770-4B15-980D-26CAC1130805}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{C7968AAB-D770-4B15-980D-26CAC1130805}.Release|Any CPU.Build.0 = Release|Any CPU
+		{10F64856-430B-4180-8265-9FC77723078C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{10F64856-430B-4180-8265-9FC77723078C}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{10F64856-430B-4180-8265-9FC77723078C}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{10F64856-430B-4180-8265-9FC77723078C}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{95A42D77-D8E6-4BB3-9A61-DA251EDF5AC6} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
+		{10F64856-430B-4180-8265-9FC77723078C} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
 		SolutionGuid = {FE695860-AB79-480F-A32D-F707F2C998A6}

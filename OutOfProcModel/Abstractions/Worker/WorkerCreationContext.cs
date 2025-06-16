@@ -1,3 +1,7 @@
-﻿namespace OutOfProcModel.Abstractions.Worker;
+﻿using OutOfProcModel.Abstractions.Mock;
 
-public record WorkerCreationContext(string WorkerId, string ApplicationId, string ApplicationVersion, IEnumerable<string> Capabilities);
+namespace OutOfProcModel.Abstractions.Worker;
+
+public record WorkerCreationContext(
+    WorkerDefinition Definition,
+    IDictionary<string, object> Properties);

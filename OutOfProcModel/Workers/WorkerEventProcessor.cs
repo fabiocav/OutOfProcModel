@@ -3,13 +3,13 @@ using OutOfProcModel.Abstractions.Worker;
 
 namespace OutOfProcModel.Workers;
 
-public class WorkerEventProcessor(IWorkerResolver handlerResolver) : IEventProcessor
+internal class WorkerEventProcessor(IWorkerResolver workerResolver) : IEventProcessor
 {
-    private readonly IWorkerResolver _handlerResolver = handlerResolver;
+    private readonly IWorkerResolver _workerResolver = workerResolver;
 
     public async ValueTask<EventResult> ProcessEvent(EventContext context)
     {
-        var worker = _handlerResolver.ResolveWorker(context.ApplicationId);
+        var worker = _workerResolver.ResolveWorker(context.ApplicationId);
 
         if (worker == null)
         {
@@ -21,6 +21,6 @@ public class WorkerEventProcessor(IWorkerResolver handlerResolver) : IEventProce
         // now draining... (a race between resolving and processing) should we resolve another worker and try again?
         var result = await worker.ProcessEvent(context.InvocationContext);
 
-        return new EventResult(result, worker.WorkerId);
+        return new EventResult(result, worker.Definition.WorkerId);
     }
 }

@@ -1,13 +1,14 @@
 ﻿@page "/functions"
-@using Grpc.Core
-@using Grpc.Net.Client
-@using OutOfProcModel.Abstractions.ControlPlane
-@using OutOfProcModel.FunctionsHost.Grpc
-@using ProtoBuf.Grpc.Client
 @using System.Collections.Concurrent
-@using System.Threading.Channels
-@using System.Text.Json
 @using System.Diagnostics
+@using System.Text.Json
+@using System.Threading.Channels
+@using OutOfProcModel.Abstractions.ControlPlane
+@using OutOfProcModel.FunctionsHost
+@using OutOfProcModel.FunctionsHost.Grpc
+@using OutOfProcModel.Grpc.Abstractions
+@using ProtoBuf.Grpc.Client
+@using GrpcChannel = global::Grpc.Net.Client.GrpcChannel
 @rendermode InteractiveServer
 @inject ILogger<Functions> Logger
 @inject IHttpClientFactory HttpClientFactory
@@ -188,20 +189,19 @@
 
     public async Task SpecializeWorkerAsync()
     {
+        // Tell the WorkerController to specialize a worker
         _functionsAdminService ??= CreateFunctionsAdminGrpcService(Config);
 
-        // Tell the WorkerController to specialize a worker
-        var appContext = new ApplicationContext(_applicationId, "1.0.0");
-
         // TODO: fix this... needs to be placeholder for matching right now
-        var runtimeEnvironment = new RuntimeEnvironment(_runtimeSpecialize, _versionSpecialize, _archSpecialize, isPlaceholder: true);
+        var runtimeEnvironment = new RuntimeEnvironment(_runtimeSpecialize, _versionSpecialize, _archSpecialize, IsPlaceholder: true);
 
         // TODO: think through races here?
         var result = await _workerControllerClient.GetAsync("/status");
         var controllerStatus = await result.Content.ReadAsStringAsync();
         controllerStatus = JsonSerializer.Deserialize<string>(controllerStatus)!;
 
-        await _functionsAdminService.SpecializeApplicationAsync(new() { ApplicationContext = appContext, RuntimeEnvironment = runtimeEnvironment });
+        var specContext = new SpecializationContext(_applicationId, "1.0.0", runtimeEnvironment);
+        await _functionsAdminService.SpecializeApplicationAsync(specContext);
 
         _isPlaceholder = false; // after specialization, we are no longer a placeholder
     }

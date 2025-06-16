@@ -1,4 +1,5 @@
-﻿using OutOfProcModel.Abstractions.Worker;
+﻿
+using OutOfProcModel.Abstractions.Worker;
 
 namespace OutOfProcModel.Abstractions.ControlPlane;
 

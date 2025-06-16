@@ -1,6 +1,0 @@
-@OutOfProcModel.WorkerController_HostAddress = http://localhost:5184
-
-GET {{OutOfProcModel.WorkerController_HostAddress}}/weatherforecast/
-Accept: application/json
-
-###
