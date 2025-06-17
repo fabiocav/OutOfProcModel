@@ -1,3 +1,9 @@
 ﻿namespace OutOfProcModel.Abstractions.ControlPlane;
 
-public record RuntimeEnvironment(string Runtime, string Version, string Architecture, bool IsPlaceholder);
+public record RuntimeEnvironment(string Runtime, string Version, string Architecture, bool IsPlaceholder)
+{
+    public override string ToString()
+    {
+        return $"{Runtime} | {Version} | {Architecture}";
+    }
+}

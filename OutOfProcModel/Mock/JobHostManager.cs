@@ -60,9 +60,9 @@ public class JobHostManager(IServiceCollection rootServices, IServiceProvider ro
         return builder.Build();
     }
 
-    public Task<JobHost> GetJobHostAsync(string applicationId)
+    public Task<bool> TryGetJobHostAsync(string applicationId, out JobHost? jobHost)
     {
-        return Task.FromResult(_jobHosts[applicationId]);
+        return Task.FromResult(_jobHosts.TryGetValue(applicationId, out jobHost));
     }
 
     public async Task RemoveJobHostAsync(string applicationId)
@@ -74,8 +74,7 @@ public class JobHostManager(IServiceCollection rootServices, IServiceProvider ro
 
     public async Task AssignWorkerAsync(WorkerCreationContext context)
     {
-        var jobHost = await GetJobHostAsync(context.Definition.ApplicationId);
-        if (jobHost != null)
+        if (await TryGetJobHostAsync(context.Definition.ApplicationId, out var jobHost) && jobHost is not null)
         {
             await jobHost.WorkerManager.CreateWorkerAsync(context);
         }
@@ -83,8 +82,7 @@ public class JobHostManager(IServiceCollection rootServices, IServiceProvider ro
 
     public async Task HandleMessageAsync(MessageFromWorker message)
     {
-        var jobHost = await GetJobHostAsync(message.ApplicationId);
-        if (jobHost != null)
+        if (await TryGetJobHostAsync(message.ApplicationId, out var jobHost) && jobHost is not null)
         {
             await jobHost.Services.GetRequiredService<MessageHandlerPipeline>().HandleMessage(message);
         }
@@ -144,7 +142,7 @@ public interface IJobHostManager
     // gets or starts a new JobHost for this specific applicationId
     Task<JobHost> GetOrAddJobHostAsync(string applicationId, Func<JobHostStartContext> contextFactory, Action<IServiceCollection> configureServices);
 
-    Task<JobHost> GetJobHostAsync(string applicationId);
+    Task<bool> TryGetJobHostAsync(string applicationId, out JobHost? jobHost);
 
     Task RemoveJobHostAsync(string applicationId);
 

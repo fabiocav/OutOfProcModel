@@ -1,6 +1,6 @@
-using System.Text.Json;
 using OutOfProcModel.Abstractions.ControlPlane;
 using OutOfProcModel.WorkerController;
+using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -38,10 +38,6 @@ app.MapPost("/removeworker", async (HttpRequest request, DefaultWorkerController
     var appContext = payload.GetProperty("applicationContext").Deserialize<ApplicationContext>(serializerOptions);
     //workerController.DecrementWorkerTarget(appContext!, wo!);
     return Results.Accepted();
-});
-
-app.MapPost("/specializeworker", async (DefaultWorkerController workerController) =>
-{
 });
 
 app.MapGet("/status", (DefaultWorkerController workerController) =>

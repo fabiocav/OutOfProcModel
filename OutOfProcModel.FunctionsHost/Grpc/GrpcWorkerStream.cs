@@ -93,7 +93,7 @@ internal class GrpcWorkerStream
                 // Handle the request
                 switch (req.MessageType)
                 {
-                    case FunctionsGrpcMessage.StartStream:
+                    case FunctionsGrpcMessage.StartStream: // note: 
                         _ = HandleStartStreamAsync(req);
                         break;
                     case FunctionsGrpcMessage.MetadataResponse:
@@ -127,7 +127,13 @@ internal class GrpcWorkerStream
         // - stop token was called and we exited b/c of that
         // - the worker disconnected and is no longer sending us data
         // What all do we need to clean up?
-        await StopAsync();
+        // await StopAsync();
+
+        await _jobHostManager.TryGetJobHostAsync(GetCurrentWorkerState().Definition.ApplicationId, out var jobHost);
+        if (jobHost != null)
+        {
+            await jobHost.WorkerManager.RemoveWorkerAsync(GetCurrentWorkerState().Definition.WorkerId);
+        }
     }
 
     private void HandleJobHostMessage(GrpcFromWorker req)
@@ -203,7 +209,7 @@ internal class GrpcWorkerStream
 
     private static async Task StartNewJobHostAsync(WorkerDefinition workerDef, IWorkerChannel channel, IJobHostManager jobHostManager)
     {
-        await CreateJobHostAsync(workerDef, channel, jobHostManager);
+        var jobHost = await CreateJobHostAsync(workerDef, channel, jobHostManager);
 
         var contextProperties = new Dictionary<string, object>
         {
@@ -211,7 +217,6 @@ internal class GrpcWorkerStream
         };
 
         var context = new WorkerCreationContext(workerDef, contextProperties);
-        var jobHost = await jobHostManager.GetJobHostAsync(workerDef.ApplicationId);
         await jobHost.WorkerManager.CreateWorkerAsync(context);
     }
 
@@ -246,7 +251,7 @@ internal class GrpcWorkerStream
             return false;
         }
 
-        if (_placeholderWorkerState.Definition.RuntimeEnvironment != runtimeEnvironmentToMatch)
+        if (_placeholderWorkerState.Definition.RuntimeEnvironment != runtimeEnvironmentToMatch with { IsPlaceholder = true })
         {
             return false;
         }
@@ -259,7 +264,7 @@ internal class GrpcWorkerStream
         // This will drain/stop this specific IWorker and preserve the Channels for specialization. Others will be shutdown outside of this class.
         // TODO -- is there a way we can guarantee this? Like a chained Channel that we can disconnect and Close()?
         var currentDef = GetCurrentWorkerState().Definition;
-        var jobHost = await _jobHostManager.GetJobHostAsync(currentDef.ApplicationId);
+        await _jobHostManager.TryGetJobHostAsync(currentDef.ApplicationId, out var jobHost);
         await jobHost.WorkerManager.RemoveWorkerAsync(currentDef.WorkerId);
 
         await _channel.SpecializationCompletion;

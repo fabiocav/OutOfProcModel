@@ -189,20 +189,22 @@
 
     public async Task SpecializeWorkerAsync()
     {
-        // Tell the WorkerController to specialize a worker
-        _functionsAdminService ??= CreateFunctionsAdminGrpcService(Config);
-
-        // TODO: fix this... needs to be placeholder for matching right now
-        var runtimeEnvironment = new RuntimeEnvironment(_runtimeSpecialize, _versionSpecialize, _archSpecialize, IsPlaceholder: true);
-
-        // TODO: think through races here?
-        var result = await _workerControllerClient.GetAsync("/status");
-        var controllerStatus = await result.Content.ReadAsStringAsync();
-        controllerStatus = JsonSerializer.Deserialize<string>(controllerStatus)!;
-
-        var specContext = new SpecializationContext(_applicationId, "1.0.0", runtimeEnvironment);
-        await _functionsAdminService.SpecializeApplicationAsync(specContext);
-
-        _isPlaceholder = false; // after specialization, we are no longer a placeholder
+        // Tell the WorkerController to add a worker -- it will specialize it if it can
+        _ = await _workerControllerClient.PostAsJsonAsync("/addworker",
+        new
+        {
+            applicationContext = new
+            {
+                ApplicationId = _applicationId,
+                ApplicationVersion = "1.0.0"
+            },
+            runtimeEnvironment = new
+            {
+                Runtime = _runtime,
+                Version = _version,
+                Architecture = _arch,
+                IsPlaceholder = false
+            }
+        });       
     }
 }

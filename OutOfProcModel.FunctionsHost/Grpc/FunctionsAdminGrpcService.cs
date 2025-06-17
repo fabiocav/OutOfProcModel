@@ -17,7 +17,13 @@ internal class FunctionsAdminGrpcService(FunctionsHostGrpcService functionsHost,
 
     public async Task<InvokeResult> InvokeAsync(InvokeContext context)
     {
-        var jobHost = (await _jobHostManager.GetJobHostAsync(context.ApplicationId))!;
+        await _jobHostManager.TryGetJobHostAsync(context.ApplicationId, out var jobHost);
+
+        if (jobHost == null)
+        {
+            return new InvokeResult { InvocationId = string.Empty }; // signal it failed to find the job host
+        }
+
         var processor = jobHost.Services.GetRequiredService<IEventProcessor>();
         var result = await processor.ProcessEvent(new EventContext(context.ApplicationId, new InvocationContext($"i_{Guid.NewGuid().ToString()[..8]}", "random_data")));
 

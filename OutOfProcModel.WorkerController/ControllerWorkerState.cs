@@ -28,7 +28,7 @@ internal record ControllerWorkerDefinition(ApplicationContext ApplicationContext
 internal enum ControllerWorkerStatus
 {
     Created,
-    Iniitializing,
+    Initializing,
     Initialized,
     RunningAsPlaceholder,
     Specializing,

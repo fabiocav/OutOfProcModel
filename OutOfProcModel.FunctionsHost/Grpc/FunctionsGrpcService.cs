@@ -11,6 +11,7 @@ internal class FunctionsHostGrpcService(IJobHostManager jobHostManager) : IFunct
     // TODO -- should this be here?
     private readonly IList<GrpcWorkerStream> _activeStreams = [];
 
+    // TODO: rename this... shouldn't be called startstream
     public async IAsyncEnumerable<GrpcToWorker> StartStreamAsync(IAsyncEnumerable<GrpcFromWorker> requests)
     {
         var stream = new GrpcWorkerStream(_jobHostManager);
@@ -28,6 +29,11 @@ internal class FunctionsHostGrpcService(IJobHostManager jobHostManager) : IFunct
     {
         // If not specialized, we need to remove them ourselves.
         List<GrpcWorkerStream> _streamsToRemove = [];
+
+        if (await _jobHostManager.TryGetJobHostAsync(applicationId, out var jobHost))
+        {
+            return; // already specialized, nothing to do
+        }
 
         foreach (var stream in _activeStreams)
         {
