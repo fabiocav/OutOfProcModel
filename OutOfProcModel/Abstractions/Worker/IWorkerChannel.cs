@@ -3,14 +3,6 @@
 public interface IWorkerChannel : IWorkerChannelWriter
 {
     IAsyncEnumerable<MessageFromWorker> ReadAsync(CancellationToken cancellationToken);
-
-    /// <summary>
-    /// Signals that the worker is exiting and will not be using this channel again. Different IWorkerChannels may
-    /// handle this call differently.
-    /// In the case of specializable channels, an implementation can skip disconnection internally to allow for channel re-use.
-    /// </summary>
-    /// <returns>An awaitable Task.</returns>
-    Task DisconnectAsync();
 }
 
 // Some services only need to be able to write. We only want a single reader

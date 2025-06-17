@@ -16,6 +16,8 @@ internal class GrpcWorkerStream
     //       this channel, so it should likely move to a factory where that can be managed.
     private readonly BidirectionalChannel _channel = new();
 
+    private readonly ChannelRouter _channelRouter;
+
     private Task? _readTask;
 
     // Keep these separate for better tracking of state
@@ -25,6 +27,7 @@ internal class GrpcWorkerStream
     public GrpcWorkerStream(IJobHostManager jobHostManager)
     {
         _jobHostManager = jobHostManager;
+        _channelRouter = new(_channel);
     }
 
     public StreamState StreamState { get; private set; } = StreamState.None;
@@ -36,6 +39,8 @@ internal class GrpcWorkerStream
 
     public async IAsyncEnumerable<GrpcToWorker> StartAsync(IAsyncEnumerable<GrpcFromWorker> requests)
     {
+        _channelRouter.Start();
+
         _readTask = ReadStreamAsync(requests, _stopTokenSource.Token);
 
         // Return all outgoing messages to the worker
@@ -100,7 +105,7 @@ internal class GrpcWorkerStream
                         HandleJobHostMessage(req);
                         break;
                     case FunctionsGrpcMessage.InvocationResponse:
-                        StreamState = ChangeState(Action.InvocationResponse);
+                        StreamState = ChangeState(WorkerAction.InvocationResponse);
                         _channel.HostMessageWriter.TryWrite(new MessageFromWorker(GetCurrentWorkerState().Definition.ApplicationId, req.MessageType, req.Properties));
                         break;
                     case FunctionsGrpcMessage.EnvironmentReloadResponse:
@@ -147,41 +152,41 @@ internal class GrpcWorkerStream
 
         StreamState = ChangeState(MapMessageType(req.MessageType));
 
-        static Action MapMessageType(string messageType) =>
+        static WorkerAction MapMessageType(string messageType) =>
             messageType switch
             {
-                FunctionsGrpcMessage.MetadataResponse => Action.MetadataResponse, // the only one for now
+                FunctionsGrpcMessage.MetadataResponse => WorkerAction.MetadataResponse, // the only one for now
                 _ => throw new InvalidOperationException($"Unknown message type: {messageType}")
             };
     }
 
     private bool IsPlaceholder => GetCurrentWorkerState() == _placeholderWorkerState;
 
-    private void ThrowIfInvalidState(Action action)
+    private void ThrowIfInvalidState(WorkerAction action)
     {
         _ = ChangeState(action);
     }
 
-    private StreamState ChangeState(Action action) =>
+    private StreamState ChangeState(WorkerAction action) =>
         (StreamState, action) switch
         {
-            (StreamState.None, Action.StartStream) => StreamState.Connected,
-            (StreamState.Connected, Action.MetadataResponse) => StreamState.Initialized,
-            (StreamState.Connected, Action.Specialize) when IsPlaceholder => StreamState.Specializing,
-            (StreamState.Connected, Action.InvocationResponse) => StreamState.Running, // This can happen when we don't need a  metadata response
-            (StreamState.Initialized, Action.InvocationResponse) when IsPlaceholder => StreamState.RunningAsPlaceholder,
-            (StreamState.Initialized, Action.InvocationResponse) when !IsPlaceholder => StreamState.Running,
-            (StreamState.RunningAsPlaceholder, Action.Specialize) => StreamState.Specializing,
-            (StreamState.RunningAsPlaceholder, Action.InvocationResponse) => StreamState.RunningAsPlaceholder,
-            (StreamState.Specializing, Action.EnvironmentReloadResponse) => StreamState.Connected,
-            (StreamState.Running, Action.InvocationResponse) => StreamState.Running,
-            (StreamState.Running, Action.Specialize) => StreamState.Specializing,
+            (StreamState.None, WorkerAction.StartStream) => StreamState.Connected,
+            (StreamState.Connected, WorkerAction.MetadataResponse) => StreamState.Initialized,
+            (StreamState.Connected, WorkerAction.Specialize) when IsPlaceholder => StreamState.Specializing,
+            (StreamState.Connected, WorkerAction.InvocationResponse) => StreamState.Running, // This can happen when we don't need a  metadata response
+            (StreamState.Initialized, WorkerAction.InvocationResponse) when IsPlaceholder => StreamState.RunningAsPlaceholder,
+            (StreamState.Initialized, WorkerAction.InvocationResponse) when !IsPlaceholder => StreamState.Running,
+            (StreamState.RunningAsPlaceholder, WorkerAction.Specialize) => StreamState.Specializing,
+            (StreamState.RunningAsPlaceholder, WorkerAction.InvocationResponse) => StreamState.RunningAsPlaceholder,
+            (StreamState.Specializing, WorkerAction.EnvironmentReloadResponse) => StreamState.Connected,
+            (StreamState.Running, WorkerAction.InvocationResponse) => StreamState.Running,
+            (StreamState.Running, WorkerAction.Specialize) => StreamState.Specializing,
             _ => throw new InvalidOperationException($"Cannot change state from '{StreamState}' with '{action}'.")
         };
 
     private async Task HandleStartStreamAsync(GrpcFromWorker startStream)
     {
-        ThrowIfInvalidState(Action.StartStream);
+        ThrowIfInvalidState(WorkerAction.StartStream);
 
         var runtime = startStream.Properties[nameof(RuntimeEnvironment.Runtime)];
         var version = startStream.Properties[nameof(RuntimeEnvironment.Version)];
@@ -202,26 +207,21 @@ internal class GrpcWorkerStream
             _workerState = new WorkerState(workerDef);
         }
 
-        StreamState = ChangeState(Action.StartStream);
+        StreamState = ChangeState(WorkerAction.StartStream);
 
-        await StartNewJobHostAsync(workerDef, _channel, _jobHostManager);
+        await StartNewJobHostAsync(workerDef, _channelRouter, _channelRouter, _jobHostManager);
     }
 
-    private static async Task StartNewJobHostAsync(WorkerDefinition workerDef, IWorkerChannel channel, IJobHostManager jobHostManager)
+    private static async Task StartNewJobHostAsync(WorkerDefinition workerDef, IWorkerChannelFactory channelFactory, IWorkerChannelWriterProvider channelWriterProvider, IJobHostManager jobHostManager)
     {
-        var jobHost = await CreateJobHostAsync(workerDef, channel, jobHostManager);
+        var jobHost = await GetOrCreateJobHostAsync(workerDef, channelFactory, channelWriterProvider, jobHostManager);
 
-        var contextProperties = new Dictionary<string, object>
-        {
-            { "Channel", channel },
-        };
-
-        var context = new WorkerCreationContext(workerDef, contextProperties);
+        var context = new WorkerCreationContext(workerDef);
         await jobHost.WorkerManager.CreateWorkerAsync(context);
     }
 
     // TODO: use the JobHostBuilder like in Functions.
-    private static Task<JobHost> CreateJobHostAsync(WorkerDefinition workerDef, IWorkerChannel channel, IJobHostManager jobHostManager)
+    private static Task<JobHost> GetOrCreateJobHostAsync(WorkerDefinition workerDef, IWorkerChannelFactory channelFactory, IWorkerChannelWriterProvider channelWriterProvider, IJobHostManager jobHostManager)
     {
         return jobHostManager.GetOrAddJobHostAsync(workerDef.ApplicationId, () =>
         {
@@ -230,11 +230,12 @@ internal class GrpcWorkerStream
         },
         services =>
         {
-            // register our provider that knows how to use the grpc details below            
-            services.AddSingleton(p => new GrpcFunctionMetadataFactory(workerDef.ApplicationId, channel));
+            // register our provider that knows how to use the grpc details below
+            services.AddSingleton<IWorkerChannelWriterProvider>(channelWriterProvider);
+            services.AddSingleton(p => new GrpcFunctionMetadataFactory(workerDef.ApplicationId, p.GetRequiredService<IWorkerChannelWriterProvider>()));
             services.AddSingleton<IFunctionMetadataFactory>(p => p.GetRequiredService<GrpcFunctionMetadataFactory>());
             services.AddSingleton<IMessageHandler>(p => p.GetRequiredService<GrpcFunctionMetadataFactory>());
-            services.AddSingleton<IWorkerFactory, GrpcWorkerFactory>();
+            services.AddSingleton<IWorkerFactory>(p => new GrpcWorkerFactory(channelFactory)); // explicitly pass this in so others don't have access to the factory
 
             if (workerDef.RuntimeEnvironment.IsPlaceholder)
             {
@@ -256,18 +257,12 @@ internal class GrpcWorkerStream
             return false;
         }
 
-        StreamState = ChangeState(Action.Specialize);
-
-        // This lets the channel know that it will be re-used and its internal Channels should not be completed.
-        _channel.MarkForSpecialization();
+        StreamState = ChangeState(WorkerAction.Specialize);
 
         // This will drain/stop this specific IWorker and preserve the Channels for specialization. Others will be shutdown outside of this class.
         // TODO -- is there a way we can guarantee this? Like a chained Channel that we can disconnect and Close()?
         var currentDef = GetCurrentWorkerState().Definition;
-        await _jobHostManager.TryGetJobHostAsync(currentDef.ApplicationId, out var jobHost);
-        await jobHost.WorkerManager.RemoveWorkerAsync(currentDef.WorkerId);
-
-        await _channel.SpecializationCompletion;
+        await _jobHostManager.RemoveJobHostAsync(currentDef.ApplicationId);
 
         // Tell the worker to specialize with new environment details.
         // It will respond back to us with its details (like capabilities).
@@ -290,11 +285,11 @@ internal class GrpcWorkerStream
             throw new InvalidOperationException("WorkerState is not initialized as expected. Cannot handle environment reload response.");
         }
 
-        StreamState = ChangeState(Action.EnvironmentReloadResponse);
+        StreamState = ChangeState(WorkerAction.EnvironmentReloadResponse);
 
         var capabilities = rpc.Properties["Capabilities"].Split(';');
         _workerState = _placeholderWorkerState.Specialize(rpc.Properties["ApplicationId"], rpc.Properties["ApplicationVersion"], capabilities);
-        await StartNewJobHostAsync(_workerState.Definition, _channel, _jobHostManager);
+        await StartNewJobHostAsync(_workerState.Definition, _channelRouter, _channelRouter, _jobHostManager);
     }
 }
 
@@ -310,7 +305,7 @@ internal enum StreamState
     Stopped
 }
 
-internal enum Action
+internal enum WorkerAction
 {
     StartStream,
     MetadataResponse,

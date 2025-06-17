@@ -6,15 +6,15 @@ namespace OutOfProcModel.FunctionsHost.Grpc;
 public class GrpcFunctionMetadataFactory : IFunctionMetadataFactory, IMessageHandler
 {
     private readonly string _applicationId;
-    private readonly IWorkerChannelWriter _channelWriter;
+    private readonly IWorkerChannelWriter _channelWriterProvider;
 
     private readonly TaskCompletionSource<IEnumerable<string>> _metadataTaskCompletionSource = new();
     private readonly Lazy<Task<IEnumerable<string>>> _metadataLazy;
 
-    public GrpcFunctionMetadataFactory(string applicationId, IWorkerChannelWriter channelWriter)
+    public GrpcFunctionMetadataFactory(string applicationId, IWorkerChannelWriterProvider channelWriterProvider)
     {
         _applicationId = applicationId;
-        _channelWriter = channelWriter;
+        _channelWriterProvider = channelWriterProvider.GetWriter(applicationId);
         _metadataLazy = new(LoadMetadataAsync);
     }
 
@@ -25,7 +25,7 @@ public class GrpcFunctionMetadataFactory : IFunctionMetadataFactory, IMessageHan
 
     private Task<IEnumerable<string>> LoadMetadataAsync()
     {
-        _channelWriter.TryWrite(new MessageToWorker(_applicationId, FunctionsGrpcMessage.MetadataRequest, new Dictionary<string, string>()));
+        _channelWriterProvider.TryWrite(new MessageToWorker(_applicationId, FunctionsGrpcMessage.MetadataRequest, new Dictionary<string, string>()));
         return _metadataTaskCompletionSource.Task;
     }
 

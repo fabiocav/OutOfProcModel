@@ -6,21 +6,21 @@ using System.Collections.Concurrent;
 
 namespace OutOfProcModel.FunctionsHost.Grpc;
 
-internal class GrpcWorker : IWorker, IDisposable
+internal class GrpcWorker : IWorker, IAsyncDisposable
 {
-    private readonly ConcurrentDictionary<string, TaskCompletionSource<InvocationResult>> _executingInvocations = [];
+    private readonly IWorkerChannel _channel;
     private readonly Task _readLoopTask;
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<InvocationResult>> _executingInvocations = [];
     private readonly CancellationTokenSource _readLoopCancellationSource = new();
 
-    public GrpcWorker(WorkerDefinition workerDefinition, IWorkerChannel channel)
+    public GrpcWorker(WorkerDefinition workerDefinition, IWorkerChannelFactory channelFactory)
     {
         Definition = workerDefinition ?? throw new ArgumentNullException(nameof(workerDefinition));
+        _channel = channelFactory.CreateWorkerChannel(workerDefinition.ApplicationId);
 
-        _channel = channel;
+        // TODO: should be in some kind of StartAsync()?
         _readLoopTask = StartReadLoopAsync(_readLoopCancellationSource.Token);
     }
-
-    private readonly IWorkerChannel _channel;
 
     public WorkerDefinition Definition { get; }
 
@@ -47,9 +47,6 @@ internal class GrpcWorker : IWorker, IDisposable
         {
             // normal shutdown
         }
-
-        // We'll never read from this again.
-        await _channel.DisconnectAsync();
     }
 
     public ValueTask<InvocationResult> ProcessEvent(InvocationContext context)
@@ -98,8 +95,13 @@ internal class GrpcWorker : IWorker, IDisposable
         Status = WorkerStatus.Stopped;
     }
 
-    public void Dispose()
+    public async ValueTask DisposeAsync()
     {
-        StopAsync().GetAwaiter().GetResult();
+        await StopAsync();
+
+        if (_channel is IAsyncDisposable asyncDisposable)
+        {
+            await asyncDisposable.DisposeAsync();
+        }
     }
 }

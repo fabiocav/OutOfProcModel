@@ -2,6 +2,4 @@
 
 namespace OutOfProcModel.Abstractions.Worker;
 
-public record WorkerCreationContext(
-    WorkerDefinition Definition,
-    IDictionary<string, object> Properties);
+public record WorkerCreationContext(WorkerDefinition Definition);

@@ -4,9 +4,42 @@ using System.Threading.Channels;
 
 namespace OutOfProcModel.FunctionsHost.Grpc;
 
-// a class to hold the endpoints of our bidirectional channels and only expose the necessary
-// interfaces for the host and worker to communicate with each other
-public class BidirectionalChannel : IWorkerChannel
+internal class GrpcWorkerChannel : IWorkerChannel, IAsyncDisposable
+{
+    private readonly BidirectionalChannel _channel = new();
+
+    public ChannelReader<MessageToWorker> WorkerMessageReader => _channel.WorkerMessageReader;
+
+    public ChannelWriter<MessageFromWorker> HostMessageWriter => _channel.HostMessageWriter;
+
+    public async IAsyncEnumerable<MessageFromWorker> ReadAsync([EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        while (await _channel.HostMessageReader.WaitToReadAsync(cancellationToken))
+        {
+            while (!cancellationToken.IsCancellationRequested && _channel.HostMessageReader.TryRead(out var message))
+            {
+                yield return message;
+            }
+        }
+    }
+
+    public bool TryWrite(MessageToWorker message)
+    {
+        return _channel.WorkerMessageWriter.TryWrite(message);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        // this signals upstream that we are done writing messages
+        _channel.HostMessageWriter.Complete();
+        _channel.WorkerMessageWriter.Complete();
+        await _channel.HostMessageReader.Completion;
+        await _channel.WorkerMessageReader.Completion;
+    }
+}
+
+// a class to hold the endpoints of our bidirectional channels
+public class BidirectionalChannel
 {
     // for messages going from Worker -> Host
     private readonly Channel<MessageFromWorker> _hostMessageChannel = Channel.CreateUnbounded<MessageFromWorker>();
@@ -14,52 +47,111 @@ public class BidirectionalChannel : IWorkerChannel
     // for messages going from Host -> Worker
     private readonly Channel<MessageToWorker> _workerMessageChannel = Channel.CreateUnbounded<MessageToWorker>();
 
-    private TaskCompletionSource? _specializationTcs;
-
     public ChannelReader<MessageToWorker> WorkerMessageReader => _workerMessageChannel.Reader;
-
-    public ChannelWriter<MessageFromWorker> HostMessageWriter => _hostMessageChannel.Writer;
-
-    public ChannelReader<MessageFromWorker> HostMessageReader => _hostMessageChannel.Reader;
 
     public ChannelWriter<MessageToWorker> WorkerMessageWriter => _workerMessageChannel.Writer;
 
-    // Only the IWorker should call the IWorkerChannel implementations.
-    Task IWorkerChannel.DisconnectAsync()
-    {
-        if (_specializationTcs is not null && !_specializationTcs.Task.IsCompleted)
-        {
-            // The one-time placeholder disconnect call occurred.We can now re-use this as a normal channel going forward.
-            // The next time DisconnectAsync is called, this channel will disconnect normally.
-            _specializationTcs.TrySetResult();
-            return Task.CompletedTask;
-        }
+    public ChannelReader<MessageFromWorker> HostMessageReader => _hostMessageChannel.Reader;
 
-        _hostMessageChannel.Writer.TryComplete();
-        _workerMessageChannel.Writer.TryComplete();
-        return Task.WhenAll(_hostMessageChannel.Reader.Completion, _workerMessageChannel.Reader.Completion);
+    public ChannelWriter<MessageFromWorker> HostMessageWriter => _hostMessageChannel.Writer;
+}
+
+public class ChannelRouter(BidirectionalChannel sourceChannel) : IWorkerChannelFactory, IWorkerChannelWriterProvider
+{
+    private readonly BidirectionalChannel _sourceChannel = sourceChannel ?? throw new ArgumentNullException(nameof(sourceChannel));
+    private readonly Dictionary<string, GrpcWorkerChannel> _appMap = new(StringComparer.OrdinalIgnoreCase);
+
+    private Task? _routingTask;
+
+    public void Start()
+    {
+        _routingTask = StartRoutingAsync();
     }
 
-    async IAsyncEnumerable<MessageFromWorker> IWorkerChannel.ReadAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+    private async Task StartRoutingAsync()
     {
-        while (await _hostMessageChannel.Reader.WaitToReadAsync(cancellationToken))
+        while (await _sourceChannel.HostMessageReader.WaitToReadAsync())
         {
-            while (!cancellationToken.IsCancellationRequested && _hostMessageChannel.Reader.TryRead(out var message))
+            while (_sourceChannel.HostMessageReader.TryRead(out var message))
             {
-                yield return message;
+                // route to appropriate iworker
+                if (_appMap.TryGetValue(message.ApplicationId, out var channel))
+                {
+                    if (!channel.HostMessageWriter.TryWrite(message))
+                    {
+                        // handle failure to write, e.g., channel is full or closed
+                    }
+                }
+                else
+                {
+                    // no worker found for this applicationId, handle accordingly
+                }
             }
         }
     }
 
-    bool IWorkerChannelWriter.TryWrite(MessageToWorker message)
+    public IWorkerChannel CreateWorkerChannel(string applicationId)
     {
-        return _workerMessageChannel.Writer.TryWrite(message);
+        var channel = CreateChannel(applicationId);
+
+        return new DisposableChannel(channel, () =>
+        {
+            // remove the channel from the map when disposed
+            _appMap.Remove(applicationId);
+        });
     }
 
-    internal void MarkForSpecialization()
+    private GrpcWorkerChannel CreateChannel(string applicationId)
     {
-        _specializationTcs = new TaskCompletionSource();
+        var channel = new GrpcWorkerChannel();
+
+        _appMap[applicationId] = channel;
+
+        // forward messages back to the source channel
+        _ = Task.Run(async () =>
+        {
+            while (await channel.WorkerMessageReader.WaitToReadAsync())
+            {
+                while (channel.WorkerMessageReader.TryRead(out var message))
+                {
+                    // route to worker
+                    _sourceChannel.WorkerMessageWriter.TryWrite(message);
+                }
+            }
+        });
+
+        return channel;
     }
 
-    internal Task SpecializationCompletion => _specializationTcs?.Task ?? throw new InvalidOperationException("Specialization has not been requested for this channel.");
+    public IWorkerChannelWriter GetWriter(string applicationId)
+    {
+        if (!_appMap.TryGetValue(applicationId, out var channel))
+        {
+            channel = CreateChannel(applicationId);
+        }
+        // TODO: I don't like this...
+        return channel;
+    }
+
+    private class DisposableChannel(IWorkerChannel source, Action onDispose) : IWorkerChannel, IAsyncDisposable
+    {
+        private readonly Action _onDispose = onDispose;
+        private readonly IWorkerChannel _source = source;
+
+        public IAsyncEnumerable<MessageFromWorker> ReadAsync(CancellationToken cancellationToken) => _source.ReadAsync(cancellationToken);
+
+        public bool TryWrite(MessageToWorker message) => _source.TryWrite(message);
+
+        public ValueTask DisposeAsync()
+        {
+            _onDispose();
+
+            if (_source is IAsyncDisposable asyncDisposable)
+            {
+                return asyncDisposable.DisposeAsync();
+            }
+
+            return ValueTask.CompletedTask;
+        }
+    }
 }
