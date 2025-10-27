@@ -1,10 +1,17 @@
 ﻿namespace OutOfProcModel.Abstractions.Worker;
 
+// JobHost-scoped. 
+// Retrieved by WebHost-level Grpc server when a new connection is made.
 public interface IWorkerManager
 {
-    void AddWorker(IWorker worker);
+    ValueTask<IWorkerState> CreateWorkerAsync(WorkerCreationContext worker);
 
-    bool RemoveWorker(IWorker worker);
+    /// <summary>
+    /// Removes the worker from load balancing, then Drains, Stops, and disposes it.
+    /// </summary>
+    /// <param name="workerId">The worker to remove.</param>    
+    /// <returns>true if successful.</returns>
+    Task<bool> RemoveWorkerAsync(string workerId);
 
-    IReadOnlyCollection<IWorker> GetWorkers(string applicationId);
+    IReadOnlyCollection<IWorker> GetWorkers();
 }

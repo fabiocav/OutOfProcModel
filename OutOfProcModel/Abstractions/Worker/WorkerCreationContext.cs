@@ -1,10 +1,5 @@
-﻿namespace OutOfProcModel.Abstractions.Worker;
+﻿using OutOfProcModel.Abstractions.Mock;
 
-public class WorkerCreationContext(IWorkerChannel channel, string applicationId)
-{
-    public string ApplicationId { get; set; } = applicationId;
+namespace OutOfProcModel.Abstractions.Worker;
 
-    public IWorkerChannel Channel { get; set; } = channel;
-
-    public IDictionary<string, string> Properties { get; set; } = new Dictionary<string, string>();
-}
+public record WorkerCreationContext(WorkerDefinition Definition);

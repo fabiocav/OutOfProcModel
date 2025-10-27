@@ -1,0 +1,19 @@
+﻿<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Grpc.Net.Client" Version="2.71.0" />
+    <PackageReference Include="protobuf-net" Version="3.2.52" />
+    <PackageReference Include="protobuf-net.Grpc" Version="1.2.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\OutOfProcModel.Grpc.Abstractions\OutOfProcModel.Grpc.Abstractions.csproj" />
+  </ItemGroup>
+
+</Project>
