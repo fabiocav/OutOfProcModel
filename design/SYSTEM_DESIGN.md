@@ -1939,3 +1939,348 @@ public class RuntimeHealthCheck : IHealthCheck
 6. **Settlement Service**: Should Runtime expose Azure Functions Settlement RPC service for Service Bus operations?
 7. **Worker Affinity**: Benefits of routing specific functions to specific workers vs full distribution?
 8. **Shared Memory**: Leverage RpcSharedMemory for large payload optimization?
+---
+
+## Open Question: Worker Lifecycle Management
+
+### Problem Statement
+
+In the current Functions architecture, the Runtime has full control over worker processes:
+- **Crash detection**: Runtime detects worker crash and immediately restarts it
+- **Timeout handling**: If a function execution times out, Runtime kills the worker process (can't determine if hung or in bad state)
+- **Graceful shutdown**: Runtime sends shutdown signal, waits briefly, then force-kills
+
+In the new decoupled architecture:
+- **Runtime and Worker are separate containers** - Runtime cannot directly kill Worker
+- **Both are untrusted components** - Cannot talk directly to infrastructure
+- **Only communication path**: Log messages (slow, several seconds processing time)
+- **gRPC is the control channel** - But what if Worker ignores shutdown requests?
+
+### Specific Scenarios
+
+#### Scenario 1: Function Timeout
+A function exceeds its configured timeout (e.g., 5 minutes for Consumption plan).
+
+**Current behavior**: Runtime kills worker process, restarts it.
+
+**New architecture challenges**:
+- Runtime detects timeout, sends `WorkerTerminate` message via gRPC
+- Worker is supposed to cancel execution and shut down
+- **What if Worker doesn't respond?** (hung, infinite loop, deadlock)
+
+#### Scenario 2: Worker Unresponsive
+Worker stops responding to heartbeats but gRPC connection remains open.
+
+**Current behavior**: Runtime kills worker process after heartbeat timeout.
+
+**New architecture challenges**:
+- Runtime can't force-kill a separate container
+- gRPC connection might stay open even if worker is hung
+
+#### Scenario 3: Malicious or Buggy Worker
+Worker code enters infinite loop or consumes excessive resources.
+
+**Current behavior**: Runtime kills process, protects host.
+
+**New architecture challenges**:
+- Runtime has no process-level control
+- Worker could ignore all shutdown requests
+
+### Proposed Solutions
+
+#### Option A: gRPC Disconnection + Container Health Probes
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Runtime detects timeout/hang                                    │
+├─────────────────────────────────────────────────────────────────┤
+│  1. Send WorkerTerminate via gRPC                               │
+│  2. Start grace period timer (e.g., 30 seconds)                 │
+│  3. If worker doesn't disconnect:                               │
+│     a. Runtime forcibly closes gRPC connection                  │
+│     b. Mark worker as "abandoned" in registry                   │
+│  4. Container orchestrator detects:                             │
+│     - Liveness probe fails (worker reports unhealthy when       │
+│       disconnected from Runtime)                                 │
+│     - Container gets killed and replaced                        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Pros**:
+- Uses existing container orchestration
+- No new infrastructure communication needed
+- Worker can implement health probe that checks gRPC connection
+
+**Cons**:
+- Slow - container probe intervals add latency
+- Worker must cooperate (implement proper health probe)
+- Abandoned worker could continue consuming resources until killed
+
+**Worker Health Probe Implementation**:
+```csharp
+public class WorkerHealthCheck : IHealthCheck
+{
+    private readonly IGrpcConnectionManager _connectionManager;
+    
+    public Task<HealthCheckResult> CheckHealthAsync(
+        HealthCheckContext context,
+        CancellationToken cancellationToken)
+    {
+        // If disconnected from Runtime, report unhealthy
+        // This causes container orchestrator to kill us
+        if (!_connectionManager.IsConnected)
+        {
+            return Task.FromResult(
+                HealthCheckResult.Unhealthy("Disconnected from Runtime"));
+        }
+        
+        return Task.FromResult(HealthCheckResult.Healthy());
+    }
+}
+```
+
+#### Option B: Shared Termination Signal via Storage
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Runtime writes termination signal to shared storage            │
+│  (blob, file share, or other mechanism visible to Worker)       │
+├─────────────────────────────────────────────────────────────────┤
+│  Worker periodically checks for termination signal              │
+│  If found: graceful shutdown                                     │
+│  If ignored: falls back to Option A                             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Pros**:
+- Provides backup communication channel
+- Works even if gRPC is hung
+
+**Cons**:
+- Adds complexity
+- Polling introduces latency
+- Still requires worker cooperation
+
+#### Option C: Dedicated Sidecar for Lifecycle Management
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  Pod/Container Group                                              │
+├──────────────┬──────────────┬──────────────────────────────────────┤
+│   Runtime    │    Worker    │   Lifecycle Sidecar                │
+│              │              │   (privileged, trusted)            │
+│              │              │                                    │
+│   ─────gRPC────────────────►│                                    │
+│              │              │                                    │
+│   ─────────────────────────────────── control ─────────────────►│
+│              │              │    Can force-kill Worker           │
+└──────────────┴──────────────┴──────────────────────────────────────┘
+```
+
+**Pros**:
+- Trusted component can force-kill worker
+- Fast response to termination requests
+- Works even if worker is completely unresponsive
+
+**Cons**:
+- Additional component to deploy and manage
+- Sidecar itself could fail
+- Increased resource overhead
+
+#### Option D: Scale Controller Mediated Termination
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Runtime                     Scale Controller                   │
+├─────────────────────────────────────────────────────────────────┤
+│  1. Detect timeout/hang                                         │
+│  2. Write "worker-unhealthy" log/event                          │
+│  3. Scale Controller processes event (seconds delay)            │
+│  4. Scale Controller terminates worker container                │
+│  5. Scale Controller starts replacement worker                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Pros**:
+- No new communication channels needed (uses existing logs)
+- Scale Controller has infrastructure access
+- Clean separation of concerns
+
+**Cons**:
+- **Slow** - log processing delay (several seconds)
+- Critical path depends on log pipeline health
+- May not meet SLA requirements for timeout handling
+
+#### Option E: Immediate Replacement + Eventual Cleanup (Recommended)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  "Don't wait, replace immediately"                              │
+├─────────────────────────────────────────────────────────────────┤
+│  1. Runtime detects timeout/hang                                │
+│  2. Send WorkerTerminate via gRPC (best effort)                 │
+│  3. Immediately close gRPC connection                           │
+│  4. Mark worker as "abandoned" (don't wait for confirmation)    │
+│  5. Request replacement worker via existing channel             │
+│     (if only 1 worker, priority request)                        │
+│  6. Abandoned worker eventually cleaned up by:                  │
+│     a. Its own health probe failing (sees disconnection)        │
+│     b. Container orchestrator timeout                           │
+│     c. Resource limits (OOM, CPU throttle)                      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Implementation**:
+```csharp
+public async Task HandleFunctionTimeoutAsync(
+    WorkerState worker,
+    string invocationId,
+    CancellationToken cancellationToken)
+{
+    _logger.LogWarning(
+        "Function timeout for invocation {InvocationId} on worker {WorkerId}",
+        invocationId,
+        worker.WorkerId);
+    
+    // 1. Best-effort termination request
+    try
+    {
+        var terminateMessage = new StreamingMessage
+        {
+            WorkerTerminate = new WorkerTerminate
+            {
+                GracePeriod = Duration.FromTimeSpan(TimeSpan.FromSeconds(5))
+            }
+        };
+        
+        // Fire and forget - don't await
+        _ = worker.Channel.SendAsync(terminateMessage);
+    }
+    catch (Exception ex)
+    {
+        _logger.LogDebug(ex, "Failed to send terminate message");
+    }
+    
+    // 2. Immediately close gRPC connection
+    await worker.Channel.CompleteAsync();
+    
+    // 3. Mark as abandoned (don't remove yet, for tracking)
+    worker.Status = WorkerStatus.Abandoned;
+    worker.AbandonedAt = DateTimeOffset.UtcNow;
+    
+    // 4. Fail any pending invocations on this worker
+    await FailPendingInvocationsAsync(worker, "Worker terminated due to timeout");
+    
+    // 5. Request replacement based on current capacity
+    var activeWorkers = await _workerRegistry.GetActiveWorkerCountAsync(
+        worker.ApplicationDefinition);
+    
+    if (activeWorkers == 0)
+    {
+        // Critical - no workers for this app
+        _logger.LogCritical(
+            "No active workers for {AppId}, requesting urgent replacement",
+            worker.ApplicationDefinition.ApplicationId);
+        
+        // Priority replacement request
+        await _scaleController.RequestWorkerAsync(
+            worker.ApplicationDefinition,
+            WorkerPriority.Urgent);
+    }
+    else
+    {
+        _logger.LogInformation(
+            "{ActiveWorkers} workers still active for {AppId}, " +
+            "requesting normal replacement",
+            activeWorkers,
+            worker.ApplicationDefinition.ApplicationId);
+        
+        // Normal replacement request
+        await _scaleController.RequestWorkerAsync(
+            worker.ApplicationDefinition,
+            WorkerPriority.Normal);
+    }
+    
+    // 6. Cleanup abandoned workers periodically (separate background task)
+}
+
+// Background service to clean up abandoned workers
+public class AbandonedWorkerCleanupService : BackgroundService
+{
+    private readonly TimeSpan _abandonedTimeout = TimeSpan.FromMinutes(5);
+    
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken);
+            
+            var abandonedWorkers = await _workerRegistry
+                .GetAbandonedWorkersOlderThanAsync(_abandonedTimeout);
+            
+            foreach (var worker in abandonedWorkers)
+            {
+                _logger.LogInformation(
+                    "Cleaning up abandoned worker {WorkerId} " +
+                    "(abandoned at {AbandonedAt})",
+                    worker.WorkerId,
+                    worker.AbandonedAt);
+                
+                await _workerRegistry.RemoveWorkerAsync(worker.WorkerId);
+            }
+        }
+    }
+}
+```
+
+**Why this approach**:
+1. **Speed**: Don't wait for worker cooperation - replace immediately
+2. **Resilience**: System continues functioning even if worker cleanup is delayed
+3. **No new infrastructure**: Uses existing gRPC and container orchestration
+4. **Graceful degradation**: If multiple workers exist, single timeout is less critical
+5. **Eventually consistent**: Abandoned workers get cleaned up, just not immediately
+
+### Requesting Replacement Workers
+
+**Communication Options for Replacement Requests**:
+
+| Method | Latency | Reliability | Notes |
+|--------|---------|-------------|-------|
+| Log-based signal | 3-10s | Medium | Depends on log pipeline |
+| Health probe change | 10-30s | High | Standard K8s/orchestrator |
+| Dedicated metric/event | 1-3s | Medium | Requires metric pipeline |
+| gRPC to Scale Controller | <100ms | High | Requires direct connection |
+
+**Recommendation**: If gRPC connection to Scale Controller is possible (even one-way), use it for urgent replacement requests. Fall back to log-based for non-urgent.
+
+### Decision Matrix
+
+| Scenario | Urgency | Action |
+|----------|---------|--------|
+| Timeout, multiple workers active | Low | Disconnect, normal replacement |
+| Timeout, single worker | High | Disconnect, urgent replacement |
+| Heartbeat failure, multiple workers | Medium | Disconnect, normal replacement |
+| Heartbeat failure, single worker | High | Disconnect, urgent replacement |
+| Worker crash (container exits) | N/A | Container orchestrator handles |
+| Graceful scale-down | Low | Send terminate, wait for clean exit |
+
+### Open Sub-Questions
+
+1. **Grace period duration**: How long to wait after sending `WorkerTerminate` before considering worker abandoned?
+   - Proposal: 5-10 seconds (fast), configurable per app
+
+2. **Replacement channel**: How does Runtime request urgent worker replacement?
+   - Proposal A: gRPC back-channel to Scale Controller (if feasible)
+   - Proposal B: Priority log/event that Scale Controller monitors
+   - Proposal C: Shared state that Scale Controller polls
+
+3. **Abandoned worker tracking**: How long to track abandoned workers before full cleanup?
+   - Proposal: 5 minutes (gives container orchestrator time to clean up)
+
+4. **Resource protection**: How to prevent abandoned worker from consuming resources?
+   - Proposal: Worker health probe fails when disconnected, triggering container kill
+   - Fallback: Container resource limits (CPU/memory) provide hard ceiling
+
+5. **Invocation retry**: Should invocations on abandoned workers be automatically retried?
+   - Proposal: Yes for idempotent functions (marked via attribute)
+   - Proposal: No for non-idempotent (return failure to trigger source retry if applicable)
