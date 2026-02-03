@@ -585,6 +585,188 @@ Each language team can own their worker image independently:
 
 ---
 
+## Benefits: Improved Scaling for Partitioned Sources
+
+### The Problem: Partition-Limited Throughput
+
+Event-based triggers like **Event Hubs** and **Kafka** use partitions for parallelism. In the current model, each container (Runtime + Worker) can only process events from partitions assigned to it:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Current Model: Partition Assignment                                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Event Hub (8 partitions)                                               │
+│  ┌────┬────┬────┬────┬────┬────┬────┬────┐                              │
+│  │ P0 │ P1 │ P2 │ P3 │ P4 │ P5 │ P6 │ P7 │                              │
+│  └──┬─┴──┬─┴──┬─┴──┬─┴──┬─┴──┬─┴──┬─┴──┬─┘                              │
+│     │    │    │    │    │    │    │    │                                │
+│     ▼    ▼    ▼    ▼    ▼    ▼    ▼    ▼                                │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐    │
+│  │ Container 1 │  │ Container 2 │  │ Container 3 │  │ Container 4 │    │
+│  │ Runtime     │  │ Runtime     │  │ Runtime     │  │ Runtime     │    │
+│  │ Worker (1)  │  │ Worker (1)  │  │ Worker (1)  │  │ Worker (1)  │    │
+│  │ P0, P1      │  │ P2, P3      │  │ P4, P5      │  │ P6, P7      │    │
+│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘    │
+│                                                                         │
+│  Total: 4 containers, 4 workers                                         │
+│  Max parallelism per partition: 1 worker                                │
+│  Bottleneck: Slow worker blocks entire partition                        │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**The Problem:**
+- Each partition is processed by exactly ONE worker
+- If that worker is slow (e.g., CPU-intensive processing), the partition backs up
+- Can't add more workers without adding more Runtimes
+- Event Hub partitions are fixed (typically 4-32), limiting max parallelism
+
+### New Model: Fan-Out Within Partitions
+
+With the decoupled model, a **single Runtime can distribute events to multiple workers**, even from the same partition:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  New Model: Runtime-Level Fan-Out                                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Event Hub (8 partitions)                                               │
+│  ┌────┬────┬────┬────┬────┬────┬────┬────┐                              │
+│  │ P0 │ P1 │ P2 │ P3 │ P4 │ P5 │ P6 │ P7 │                              │
+│  └──┬─┴──┬─┴──┬─┴──┬─┴──┬─┴──┬─┴──┬─┴──┬─┘                              │
+│     │    │    │    │    │    │    │    │                                │
+│     └────┴────┴────┴────┴────┴────┴────┘                                │
+│                      │                                                  │
+│                      ▼                                                  │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  Runtime (JobHost)                                               │   │
+│  │  - Receives events from ALL 8 partitions                         │   │
+│  │  - Fan-out to worker pool using routing strategy                 │   │
+│  └─────────────────────────┬───────────────────────────────────────┘   │
+│                            │                                            │
+│         ┌──────────────────┼──────────────────┐                         │
+│         ▼                  ▼                  ▼                         │
+│  ┌────────────┐     ┌────────────┐     ┌────────────┐                  │
+│  │  Worker 1  │     │  Worker 2  │     │  Worker 3  │   ... Worker N   │
+│  │  (events   │     │  (events   │     │  (events   │                  │
+│  │   from any │     │   from any │     │   from any │                  │
+│  │   partition)     │   partition)     │   partition)                  │
+│  └────────────┘     └────────────┘     └────────────┘                  │
+│                                                                         │
+│  Total: 1 Runtime, N workers (N can be >> 8 partitions)                │
+│  Max parallelism: Limited by workers, NOT partitions                   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Key Insight: Runtime Acts as Load Balancer
+
+The Runtime's JobHost receives events and distributes them across workers:
+
+```csharp
+// Runtime receives event from partition
+var eventFromPartition = await eventHubListener.ReceiveAsync();
+
+// Route to ANY available worker (not tied to partition)
+var selectedWorker = await _jobHostManager.SelectWorkerForInvocation(
+    jobHostKey,
+    new InvocationContext { Event = eventFromPartition });
+
+// Fan-out: multiple events from same partition can go to different workers
+await _jobHostManager.RouteMessageAsync(selectedWorker, invocation, ct);
+```
+
+### Throughput Comparison
+
+| Metric | Current Model | New Model | Improvement |
+|--------|---------------|-----------|-------------|
+| **Event Hub (8 partitions)** | Max 8 parallel workers | Unlimited workers | **No partition ceiling** |
+| **Slow event processing** | Blocks partition | Other workers pick up | **Eliminates hot partitions** |
+| **Worker failure** | Partition stalls until restart | Other workers continue | **Better resilience** |
+| **Scaling** | Add Runtime + Worker | Add Worker only | **Faster, cheaper scale-out** |
+
+### Example: High-Throughput Event Processing
+
+**Scenario:** Event Hub with 8 partitions, events require 500ms processing each
+
+**Current Model:**
+```
+8 partitions × 1 worker each × (1000ms / 500ms) = 16 events/sec max
+Bottleneck: Partition count limits parallelism
+```
+
+**New Model:**
+```
+8 partitions → 1 Runtime → 32 workers
+32 workers × (1000ms / 500ms) = 64 events/sec
+Improvement: 4x throughput (can scale workers independently)
+```
+
+### Ordering Considerations
+
+For scenarios requiring **per-partition ordering**, the routing strategy can ensure events from the same partition go to the same worker:
+
+```csharp
+public class PartitionAffinityStrategy : IWorkerSelectionStrategy
+{
+    public string? SelectWorker(IReadOnlyCollection<WorkerState> workers, InvocationContext context)
+    {
+        // Consistent hash: same partition always routes to same worker
+        var partitionId = context.Event.PartitionId;
+        var hash = partitionId.GetHashCode();
+        var workerList = workers.ToList();
+        return workerList[Math.Abs(hash) % workerList.Count].WorkerId;
+    }
+}
+```
+
+This gives you the best of both worlds:
+- **Default:** Maximum parallelism (events fan out to any worker)
+- **When needed:** Partition affinity for ordering guarantees
+
+### Configuration: Runtime-to-Worker Ratio Limits
+
+Some customers may want explicit control over the Runtime:Worker ratio for various reasons:
+
+| Reason | Example | Desired Ratio |
+|--------|---------|---------------|
+| **Cost control** | Limit worker sprawl | Max 10 workers per Runtime |
+| **Resource isolation** | Dedicated workers per tenant | Exactly 1:1 |
+| **Memory constraints** | Workers are memory-heavy | Max 4 workers per Runtime |
+| **Compliance** | Data locality requirements | Workers pinned to Runtime |
+| **Debugging** | Simplified troubleshooting | 1:1 during development |
+
+**Proposed Configuration:**
+
+```json
+// host.json
+{
+  "extensions": {
+    "workerModel": {
+      "maxWorkersPerRuntime": 20,        // Default: unlimited
+      "minWorkersPerRuntime": 1,         // Default: 1
+      "workerAffinityMode": "none"       // "none" | "strict" | "preferred"
+    }
+  }
+}
+```
+
+**Affinity Modes:**
+
+| Mode | Behavior |
+|------|----------|
+| `none` | Workers can be assigned to any Runtime (default, maximum flexibility) |
+| `preferred` | Workers prefer their initial Runtime but can move if needed |
+| `strict` | Workers are locked to their Runtime (1:1-like behavior, opt-in) |
+
+**Open Questions:**
+- Should this be per-Function App or per-plan?
+- How does this interact with Scale Controller decisions?
+- Should we expose this in portal or keep it advanced/hidden?
+
+---
+
 ## Changes Required in New Design
 
 ### Change 1: Worker Process Management
