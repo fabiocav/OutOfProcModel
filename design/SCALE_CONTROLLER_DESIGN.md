@@ -704,74 +704,295 @@ In the current model, Runtime reads environment variables to understand the appl
 
 ## Scale-Out
 
-### Current Model: Start New Coupled Container
+Scale-out in the new model behaves differently depending on whether this is the **first worker** (0→1) or **additional workers** (1→N) for a customer application.
+
+### Current Model: Scale-Out is Always the Same
+
+In the current model, every scale-out operation is identical - select a placeholder container and specialize it:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  Current Scale-Out                                                      │
+│  Current Model: All Scale-Out is Identical                              │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
-│  Trigger: Customer app needs more capacity                              │
-│                                                                         │
-│  Scale Controller:                                                      │
-│  1. Select placeholder container (same language/version)                │
-│  2. Specialize with customer payload                                    │
-│  3. New container joins load balancer                                   │
-│                                                                         │
-│  Before:                          After:                                │
+│  0→1 Scale-Out:                   1→N Scale-Out:                        │
 │  ┌───────────────┐               ┌───────────────┐                     │
-│  │ Container A   │               │ Container A   │                     │
-│  │ (customer X)  │               │ (customer X)  │                     │
-│  │ Runtime+Worker│               │ Runtime+Worker│                     │
-│  └───────────────┘               └───────────────┘                     │
-│                                  ┌───────────────┐                     │
-│                                  │ Container B   │ ◄── New             │
-│                                  │ (customer X)  │                     │
+│  │ Placeholder   │               │ Container A   │ (already serving)   │
+│  │ Container     │               │ Runtime+Worker│                     │
+│  │ Runtime+Worker│               └───────────────┘                     │
+│  └───────┬───────┘               ┌───────────────┐                     │
+│          │                       │ Placeholder   │                     │
+│          │ Specialize            │ Container     │                     │
+│          ▼                       │ Runtime+Worker│                     │
+│  ┌───────────────┐               └───────┬───────┘                     │
+│  │ Customer      │                       │                             │
+│  │ Container     │                       │ Specialize (same process)   │
+│  │ Runtime+Worker│                       ▼                             │
+│  └───────────────┘               ┌───────────────┐                     │
+│                                  │ Customer      │                     │
+│                                  │ Container     │                     │
 │                                  │ Runtime+Worker│                     │
 │                                  └───────────────┘                     │
 │                                                                         │
-│  Each scale-out adds full Runtime + Worker overhead                     │
+│  Key: Worker is ALREADY connected to its Runtime (same container)       │
+│       gRPC connection is ready-to-go                                    │
+│       Both 0→1 and 1→N have the same latency characteristics           │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### New Model: Add Worker to Existing Runtime
+### New Model: 0→1 vs 1→N Are Different
+
+In the new model, 0→1 and 1→N scale-out are fundamentally different operations:
+
+| Aspect | 0→1 (First Worker) | 1→N (Additional Workers) |
+|--------|-------------------|--------------------------|
+| **Target Runtime** | Placeholder Runtime (worker is already connected) | Customer's existing Runtime |
+| **Worker source** | Placeholder on same Runtime | Placeholder on *different* Runtime |
+| **gRPC connection** | Already established | Must disconnect and reconnect |
+| **Specialization** | Specialize in place | Reassign then specialize |
+| **User impact** | Cold start (user waiting) | Hidden (existing workers serve traffic) |
+
+---
+
+### 0→1 Scale-Out: First Worker for Customer
+
+When a customer application needs its first worker, we specialize a placeholder worker **in place** on its current Runtime:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  New Scale-Out                                                          │
+│  0→1 Scale-Out: Specialize In Place                                     │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
-│  Trigger: Customer app needs more capacity                              │
+│  Initial State:                                                         │
+│  ┌───────────────────────────────────────────────────────────────┐     │
+│  │ Runtime A (Placeholder)                                        │     │
+│  │ ┌─────────────────────────────────────────────────────────┐   │     │
+│  │ │ Placeholder JobHost                                      │   │     │
+│  │ │ ├─► Worker 1 (Python) ◄── This one will be specialized  │   │     │
+│  │ │ ├─► Worker 2 (Node.js)                                   │   │     │
+│  │ │ └─► Worker 3 (.NET)                                      │   │     │
+│  │ └─────────────────────────────────────────────────────────┘   │     │
+│  └───────────────────────────────────────────────────────────────┘     │
 │                                                                         │
-│  Scale Controller options:                                              │
+│  Scale Controller: "Customer X needs a Python worker"                   │
 │                                                                         │
-│  Option A: Add Worker to existing Runtime (if capacity)                 │
-│  ─────────────────────────────────────────────────────                  │
-│  Before:                          After:                                │
-│  ┌───────────────────┐           ┌───────────────────┐                 │
-│  │ Runtime           │           │ Runtime           │                 │
-│  │ └─► Worker A      │           │ ├─► Worker A      │                 │
-│  │     (customer X)  │           │ │   (customer X)  │                 │
-│  │                   │           │ └─► Worker B      │ ◄── New worker  │
-│  │                   │           │     (customer X)  │     same Runtime│
-│  └───────────────────┘           └───────────────────┘                 │
+│  Step 1: Select Worker 1 (already connected to Runtime A)               │
+│  Step 2: Mount customer payload to Runtime A                            │
+│  Step 3: Specialize Worker 1 (inject ENV, trigger reload)              │
+│  Step 4: Worker Sidecar sends WorkerSpecialized to Runtime A           │
+│  Step 5: Runtime A creates new JobHost for Customer X                  │
+│  Step 6: Worker 1 removed from Placeholder JobHost, added to new one   │
 │                                                                         │
-│  Option B: Start new Runtime + Worker (if Runtime at capacity)          │
-│  ─────────────────────────────────────────────────────────              │
-│  Before:                          After:                                │
-│  ┌───────────────────┐           ┌───────────────────┐                 │
-│  │ Runtime A         │           │ Runtime A         │                 │
-│  │ └─► 20 Workers    │           │ └─► 20 Workers    │                 │
-│  │     (at capacity) │           │     (at capacity) │                 │
-│  └───────────────────┘           └───────────────────┘                 │
-│                                  ┌───────────────────┐                 │
-│                                  │ Runtime B         │ ◄── New         │
-│                                  │ └─► Worker        │                 │
-│                                  │     (customer X)  │                 │
-│                                  └───────────────────┘                 │
+│  After 0→1:                                                             │
+│  ┌───────────────────────────────────────────────────────────────┐     │
+│  │ Runtime A (Now serving Customer X)                             │     │
+│  │ ┌─────────────────────────────────────────────────────────┐   │     │
+│  │ │ Placeholder JobHost                                      │   │     │
+│  │ │ ├─► Worker 2 (Node.js)                                   │   │     │
+│  │ │ └─► Worker 3 (.NET)                                      │   │     │
+│  │ └─────────────────────────────────────────────────────────┘   │     │
+│  │ ┌─────────────────────────────────────────────────────────┐   │     │
+│  │ │ Customer X JobHost                                       │   │     │
+│  │ │ └─► Worker 1 (Python) ◄── Now specialized               │   │     │
+│  │ └─────────────────────────────────────────────────────────┘   │     │
+│  └───────────────────────────────────────────────────────────────┘     │
+│                                                                         │
+│  Key: Worker's gRPC connection to Runtime was ALREADY established      │
+│       No reconnection overhead                                          │
+│       Runtime A is now dedicated to Customer X                          │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
+```
+
+**0→1 Flow matches the Specialization Flow** documented earlier - this is the standard specialization process where the worker is already connected to the Runtime that will serve the customer.
+
+---
+
+### 1→N Scale-Out: Additional Workers via Reassignment
+
+When a customer already has workers and needs more capacity, we must **claim workers from other Runtimes** and reassign them:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  1→N Scale-Out: Worker Reassignment                                     │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Initial State:                                                         │
+│  ┌───────────────────────────────┐   ┌───────────────────────────────┐ │
+│  │ Runtime A (Customer X)        │   │ Runtime B (Placeholder)       │ │
+│  │ ┌───────────────────────────┐ │   │ ┌───────────────────────────┐ │ │
+│  │ │ Customer X JobHost        │ │   │ │ Placeholder JobHost       │ │ │
+│  │ │ └─► Worker 1 (Python)     │ │   │ │ ├─► Worker 4 (Python) ◄─┐ │ │ │
+│  │ └───────────────────────────┘ │   │ │ ├─► Worker 5 (Node.js)  │ │ │ │
+│  └───────────────────────────────┘   │ │ └─► Worker 6 (.NET)     │ │ │ │
+│                                      │ └───────────────────────────┘ │ │
+│                                      └───────────────────────────────┘ │
+│                                                          │             │
+│  Scale Controller: "Customer X needs another Python worker"            │
+│                                        │                               │
+│                                        │ Claim this worker             │
+│                                        ▼                               │
+│  Step 1: Claim Worker 4 from Runtime B's placeholder pool              │
+│  Step 2: Disconnect Worker 4 from Runtime B (close gRPC stream)        │
+│  Step 3: Update Worker 4's RUNTIME_ENDPOINT to point to Runtime A      │
+│  Step 4: Worker Sidecar detects change, reconnects to Runtime A        │
+│  Step 5: Runtime A receives StartStream from Worker 4 (new connection) │
+│  Step 6: Specialize Worker 4 for Customer X (same as 0→1 from here)   │
+│  Step 7: Replenish placeholder pool (start new Python worker)          │
+│                                                                         │
+│  After 1→N:                                                             │
+│  ┌───────────────────────────────┐   ┌───────────────────────────────┐ │
+│  │ Runtime A (Customer X)        │   │ Runtime B (Placeholder)       │ │
+│  │ ┌───────────────────────────┐ │   │ ┌───────────────────────────┐ │ │
+│  │ │ Customer X JobHost        │ │   │ │ Placeholder JobHost       │ │ │
+│  │ │ ├─► Worker 1 (Python)     │ │   │ │ ├─► Worker 5 (Node.js)    │ │ │
+│  │ │ └─► Worker 4 (Python) NEW │ │   │ │ ├─► Worker 6 (.NET)       │ │ │
+│  │ └───────────────────────────┘ │   │ │ └─► Worker 7 (Python) NEW │ │ │
+│  └───────────────────────────────┘   │ └───────────────────────────┘ │ │
+│                                      └───────────────────────────────┘ │
+│                                                                         │
+│  Key: Worker had to DISCONNECT and RECONNECT to new Runtime            │
+│       gRPC negotiation overhead exists but is hidden                    │
+│       Worker 7 started to replenish placeholder pool                    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Why 1→N Requires Reassignment
+
+In the current model, every placeholder container has its own Runtime - the worker and Runtime are already paired. When specializing for scale-out, the worker just specializes with its existing Runtime.
+
+In the new model, placeholder workers are connected to **placeholder Runtimes**, not to the customer's Runtime. When Customer X needs another worker:
+- Customer X's Runtime is **Runtime A**
+- Available placeholder workers are on **Runtime B, C, D, etc.**
+- We can't just specialize in place - the worker must move to Customer X's Runtime
+
+### gRPC Reconnection Overhead
+
+The 1→N flow has additional overhead compared to 0→1:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Timing Comparison: 0→1 vs 1→N                                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  0→1 (No reconnection needed):                                          │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │ Specialize │ Env Reload │ JobHost Create │ Function Load │ Ready │  │
+│  │   ~50ms    │   ~50ms    │    ~100ms      │    ~200ms     │       │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│  Total: ~400ms (cold start - user is waiting)                           │
+│                                                                         │
+│  1→N (Reconnection required):                                           │
+│  ┌──────────────────────────────────────────────────────────────────────┐
+│  │ Disconnect │ Connect │ StartStream │ Specialize │ Function Load │   │
+│  │   ~10ms    │  ~50ms  │   ~30ms     │   ~100ms   │    ~200ms     │   │
+│  └──────────────────────────────────────────────────────────────────────┘
+│  Total: ~390ms (but hidden - existing workers serve traffic)            │
+│                                                                         │
+│  Key insight: 1→N overhead is similar but NOT user-visible              │
+│  ─────────────────────────────────────────────────────────              │
+│  During 1→N, Customer X's Worker 1 continues handling all requests.     │
+│  Worker 4 only receives traffic AFTER it reports ready.                 │
+│  No request sits waiting on Worker 4 during reconnection.               │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Worker Sidecar: Handling Reconnection
+
+The Worker Sidecar detects the Runtime endpoint change and performs the reconnection:
+
+```csharp
+public class WorkerSidecar
+{
+    private string _currentRuntimeEndpoint;
+    private GrpcChannel _runtimeChannel;
+    private AsyncDuplexStreamingCall<StreamingMessage, StreamingMessage> _stream;
+    
+    // Called when environment variables change (e.g., via container update)
+    public async Task OnEnvironmentChangedAsync()
+    {
+        var newEndpoint = Environment.GetEnvironmentVariable("RUNTIME_ENDPOINT");
+        var reconnectSignal = Environment.GetEnvironmentVariable("RECONNECT_SIGNAL");
+        
+        // Detect if we need to reconnect to a different Runtime
+        if (!string.IsNullOrEmpty(reconnectSignal) && 
+            newEndpoint != _currentRuntimeEndpoint)
+        {
+            _logger.LogInformation(
+                "Reconnection signal received. " +
+                "Switching Runtime: {OldEndpoint} → {NewEndpoint}",
+                _currentRuntimeEndpoint,
+                newEndpoint);
+            
+            await ReconnectToRuntimeAsync(newEndpoint);
+        }
+    }
+    
+    private async Task ReconnectToRuntimeAsync(string newEndpoint)
+    {
+        // Step 1: Gracefully close existing connection
+        try
+        {
+            await _stream.RequestStream.CompleteAsync();
+            _runtimeChannel?.Dispose();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error during graceful disconnect");
+        }
+        
+        // Step 2: Connect to new Runtime
+        _currentRuntimeEndpoint = newEndpoint;
+        _runtimeChannel = GrpcChannel.ForAddress(newEndpoint);
+        
+        var client = new FunctionRpc.FunctionRpcClient(_runtimeChannel);
+        _stream = client.EventStream();
+        
+        // Step 3: Send StartStream (same as initial connection)
+        var startStream = CreateStartStreamMessage();
+        await _stream.RequestStream.WriteAsync(startStream);
+        
+        _logger.LogInformation("Connected to new Runtime at {Endpoint}", newEndpoint);
+        
+        // Step 4: Resume bidirectional streaming
+        // From Runtime's perspective, this looks like a brand new worker
+        await ProcessMessagesAsync();
+    }
+}
+```
+
+### Runtime Perspective: Same Flow for New or Reassigned Worker
+
+From the Runtime's perspective, a reassigned worker (1→N) looks exactly like a new worker connecting via StartStream. The Runtime uses the same code path:
+
+```csharp
+// In Runtime: Handles both new workers AND reassigned workers
+public async Task HandleEventStream(
+    IAsyncStreamReader<StreamingMessage> requestStream,
+    IServerStreamWriter<StreamingMessage> responseStream,
+    ServerCallContext context)
+{
+    // First message is always StartStream
+    var message = await requestStream.MoveNext(context.CancellationToken);
+    var startStream = message.StartStream;
+    
+    _logger.LogInformation(
+        "Worker connected: {WorkerId} ({Language})",
+        startStream.WorkerId,
+        startStream.Properties["Language"]);
+    
+    // Register worker - same for new or reassigned
+    var workerState = await RegisterWorkerAsync(startStream);
+    
+    // Send WorkerInitRequest, process WorkerInitResponse
+    await InitializeWorkerAsync(workerState, requestStream, responseStream);
+    
+    // ... rest of StartStream flow
+    // Eventually WorkerSpecialized arrives and we associate with JobHost
+}
 ```
 
 ### Scale-Out Decision Algorithm
@@ -783,90 +1004,211 @@ public class ScaleOutOrchestrator
         CustomerApp app,
         int additionalWorkersNeeded)
     {
+        // Determine if this is 0→1 or 1→N
+        var existingWorkers = await _stateManager.GetWorkersForAppAsync(app.ApplicationId);
+        
+        if (existingWorkers.Count == 0)
+        {
+            // 0→1: First worker - use standard specialization
+            return await FirstWorkerScaleOutAsync(app);
+        }
+        else
+        {
+            // 1→N: Additional workers - requires reassignment
+            return await AdditionalWorkersScaleOutAsync(app, additionalWorkersNeeded);
+        }
+    }
+    
+    private async Task<ScaleOutResult> FirstWorkerScaleOutAsync(CustomerApp app)
+    {
+        _logger.LogInformation(
+            "0→1 scale-out for {AppId}: Using standard specialization",
+            app.ApplicationId);
+        
+        // Find placeholder worker on any placeholder Runtime
+        var placeholder = await FindPlaceholderWorkerAsync(
+            app.Language,
+            app.LanguageVersion);
+        
+        if (placeholder == null)
+        {
+            throw new NoPlaceholderAvailableException(app.Language, app.LanguageVersion);
+        }
+        
+        // Specialize in place - worker stays on its current Runtime
+        // Runtime becomes dedicated to this customer
+        var result = await _specializationOrchestrator.SpecializeWorkerAsync(
+            app,
+            placeholder);
+        
+        return new ScaleOutResult(new[] { result.Worker });
+    }
+    
+    private async Task<ScaleOutResult> AdditionalWorkersScaleOutAsync(
+        CustomerApp app,
+        int count)
+    {
+        _logger.LogInformation(
+            "1→N scale-out for {AppId}: Reassigning {Count} workers from placeholder pool",
+            app.ApplicationId,
+            count);
+        
+        // Find the Runtime already serving this customer
+        var customerRuntime = await _stateManager.GetRuntimeForAppAsync(app.ApplicationId);
+        
         var results = new List<WorkerInstance>();
         
-        for (int i = 0; i < additionalWorkersNeeded; i++)
+        for (int i = 0; i < count; i++)
         {
-            // Find existing Runtime with capacity for this app
-            var existingRuntime = await FindRuntimeWithCapacityAsync(app);
+            // Find placeholder worker (will be on a DIFFERENT Runtime)
+            var placeholder = await FindPlaceholderWorkerAsync(
+                app.Language,
+                app.LanguageVersion);
             
-            if (existingRuntime != null)
+            if (placeholder == null)
             {
-                // Option A: Add worker to existing Runtime
-                _logger.LogInformation(
-                    "Adding worker for {AppId} to existing Runtime {RuntimeId}",
-                    app.ApplicationId,
-                    existingRuntime.RuntimeId);
-                
-                var worker = await AddWorkerToRuntimeAsync(
-                    existingRuntime,
-                    app);
-                
-                results.Add(worker);
+                _logger.LogWarning(
+                    "No more placeholder workers available for {Language}",
+                    app.Language);
+                break;
             }
-            else
-            {
-                // Option B: Need new Runtime + Worker
-                _logger.LogInformation(
-                    "Starting new Runtime + Worker for {AppId} (existing Runtimes at capacity)",
-                    app.ApplicationId);
-                
-                var (runtime, worker) = await StartNewRuntimeWithWorkerAsync(app);
-                
-                results.Add(worker);
-            }
+            
+            // Reassign: disconnect from placeholder Runtime, reconnect to customer Runtime
+            var worker = await ReassignWorkerAsync(
+                placeholder,
+                customerRuntime,
+                app);
+            
+            results.Add(worker);
+            
+            // Async replenishment - don't wait
+            _ = ReplenishPlaceholderAsync(app.Language, app.LanguageVersion);
         }
         
         return new ScaleOutResult(results);
     }
     
-    private async Task<RuntimeInstance?> FindRuntimeWithCapacityAsync(CustomerApp app)
-    {
-        // Prefer Runtimes that already have workers for this app
-        // (JobHost already exists, faster association)
-        var runtimesWithApp = await _stateManager
-            .GetRuntimesServingAppAsync(app.ApplicationId);
-        
-        foreach (var runtime in runtimesWithApp)
-        {
-            if (runtime.CurrentWorkerCount < runtime.MaxWorkers)
-            {
-                return runtime;
-            }
-        }
-        
-        // No existing Runtime has capacity
-        return null;
-    }
-    
-    private async Task<WorkerInstance> AddWorkerToRuntimeAsync(
-        RuntimeInstance runtime,
+    private async Task<WorkerInstance> ReassignWorkerAsync(
+        WorkerInstance placeholder,
+        RuntimeInstance targetRuntime,
         CustomerApp app)
     {
-        // Find placeholder worker on this Runtime matching app language
-        var placeholder = await FindPlaceholderOnRuntimeAsync(
-            runtime,
-            app.Language,
-            app.LanguageVersion);
+        var correlationId = Guid.NewGuid().ToString();
         
-        if (placeholder != null)
+        _logger.LogInformation(
+            "Reassigning worker {WorkerId}: Runtime {Source} → {Target}. " +
+            "CorrelationId: {CorrelationId}",
+            placeholder.WorkerId,
+            placeholder.RuntimeId,
+            targetRuntime.RuntimeId,
+            correlationId);
+        
+        // Step 1: Update worker's target Runtime endpoint
+        await _containerOrchestrator.UpdateContainerAsync(
+            placeholder.ContainerId,
+            new ContainerUpdate
+            {
+                EnvironmentVariables = new Dictionary<string, string>
+                {
+                    ["RUNTIME_ENDPOINT"] = $"{targetRuntime.Endpoint}:{targetRuntime.Port}",
+                    ["RECONNECT_SIGNAL"] = correlationId
+                }
+            });
+        
+        // Step 2: Wait for worker to connect to new Runtime
+        // (Sidecar detects RECONNECT_SIGNAL, disconnects, reconnects)
+        var connected = await WaitForWorkerConnectionAsync(
+            targetRuntime,
+            placeholder.WorkerId,
+            timeout: TimeSpan.FromSeconds(30));
+        
+        if (!connected)
         {
-            // Specialize existing placeholder
-            var result = await _specializationOrchestrator.SpecializeWorkerAsync(
-                app,
-                placeholder);
-            
-            return result.Worker;
+            throw new ReassignmentException(
+                $"Worker {placeholder.WorkerId} failed to reconnect");
         }
-        else
+        
+        // Step 3: Update tracking
+        placeholder.RuntimeId = targetRuntime.RuntimeId;
+        
+        // Step 4: Specialize (same as 0→1 from here)
+        var result = await _specializationOrchestrator.SpecializeWorkerAsync(
+            app,
+            placeholder);
+        
+        return result.Worker;
+    }
+    
+    private async Task ReplenishPlaceholderAsync(string language, string languageVersion)
+    {
+        // Background task to replace the placeholder we just used
+        try
         {
-            // Start new worker and specialize immediately
-            var worker = await StartAndSpecializeWorkerAsync(runtime, app);
-            return worker;
+            var targetRuntime = await FindPlaceholderRuntimeWithCapacityAsync();
+            
+            var worker = await StartPlaceholderWorkerAsync(
+                targetRuntime,
+                language,
+                languageVersion);
+            
+            await WarmupWorkerAsync(worker);
+            
+            _logger.LogInformation(
+                "Placeholder pool replenished: {Language} {Version}",
+                language,
+                languageVersion);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "Failed to replenish placeholder: {Language} {Version}",
+                language,
+                languageVersion);
         }
     }
 }
 ```
+
+### Testing Considerations
+
+The difference between 0→1 and 1→N should be benchmarked:
+
+```csharp
+public class ScaleOutBenchmarks
+{
+    [Benchmark(Description = "0→1: First worker (no reconnection)")]
+    public async Task ZeroToOne_FirstWorker()
+    {
+        // Measure: Time from scale decision to worker handling first request
+        // Worker already connected to Runtime - just specialize
+    }
+    
+    [Benchmark(Description = "1→N: Additional worker (with reconnection)")]  
+    public async Task OneToN_AdditionalWorker()
+    {
+        // Measure: Time from scale decision to worker handling first request
+        // Includes: disconnect + reconnect + specialize
+    }
+    
+    [Benchmark(Description = "1→N: User-perceived latency")]
+    public async Task OneToN_UserPerceivedLatency()
+    {
+        // Measure: Does any USER REQUEST experience additional latency?
+        // Expected: No - existing workers handle traffic during reassignment
+    }
+}
+```
+
+### Summary: 0→1 vs 1→N
+
+| Scenario | Process | gRPC Connection | User Impact |
+|----------|---------|-----------------|-------------|
+| **0→1** | Specialize in place | Already connected | Cold start (waiting) |
+| **1→N** | Reassign then specialize | Disconnect + reconnect | Hidden (no waiting) |
+
+The key insight is that while 1→N has additional overhead (gRPC reconnection), this overhead is **not visible to users** because existing workers continue handling traffic while the new worker is being reassigned.
+
+---
 
 ### Multiple Workers for Same Application
 
