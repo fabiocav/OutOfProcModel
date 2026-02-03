@@ -399,6 +399,192 @@ Improvement: 3.1x increase in apps per node
 
 ---
 
+## Benefits: Simplified Container Images
+
+### The Problem: Unnecessary Dependencies
+
+In the current model, **every worker container must include the .NET Runtime** because the Functions Host (Script Host) is bundled with the worker. This creates bloated container images:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Current Model: Worker Image (e.g., Python)                             │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  Base OS Layer                                         ~50 MB    │   │
+│  ├─────────────────────────────────────────────────────────────────┤   │
+│  │  .NET Runtime 8.0 (required for Functions Host)       ~180 MB   │   │
+│  ├─────────────────────────────────────────────────────────────────┤   │
+│  │  Functions Host (Script Host)                         ~100 MB   │   │
+│  ├─────────────────────────────────────────────────────────────────┤   │
+│  │  Python Runtime                                       ~120 MB   │   │
+│  ├─────────────────────────────────────────────────────────────────┤   │
+│  │  Python Worker                                         ~30 MB   │   │
+│  ├─────────────────────────────────────────────────────────────────┤   │
+│  │  Common Dependencies (pip packages, etc.)              ~50 MB   │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  Total: ~530 MB                                                         │
+│  Unnecessary for Python: ~280 MB (.NET + Host)                          │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Why Python needs .NET today:**
+- Functions Host is written in .NET
+- Host manages worker lifecycle (starts/stops the Python process)
+- Host provides gRPC server
+- Host contains WebJobs SDK for triggers
+
+### New Model: Language-Specific Workers
+
+In the new model, workers **only need their own language runtime**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  New Model: Separate Images                                             │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Runtime Image (one shared):        Worker Image (Python):              │
+│  ┌─────────────────────────┐       ┌─────────────────────────┐         │
+│  │ Base OS          ~50 MB │       │ Base OS          ~50 MB │         │
+│  ├─────────────────────────┤       ├─────────────────────────┤         │
+│  │ .NET Runtime    ~180 MB │       │ Python Runtime  ~120 MB │         │
+│  ├─────────────────────────┤       ├─────────────────────────┤         │
+│  │ Functions Host  ~100 MB │       │ Python Worker    ~30 MB │         │
+│  ├─────────────────────────┤       ├─────────────────────────┤         │
+│  │ WebJobs SDK      ~50 MB │       │ Worker Sidecar   ~20 MB │         │
+│  └─────────────────────────┘       ├─────────────────────────┤         │
+│  Total: ~380 MB                    │ Dependencies     ~50 MB │         │
+│  (shared across all workers)       └─────────────────────────┘         │
+│                                    Total: ~270 MB                       │
+│                                    (No .NET required!)                  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Image Size Comparison by Language
+
+| Language | Current Image Size | New Worker Image | Reduction |
+|----------|-------------------|------------------|-----------|
+| **Python 3.11** | ~530 MB | ~270 MB | **49%** |
+| **Node.js 20** | ~480 MB | ~200 MB | **58%** |
+| **Java 17** | ~650 MB | ~350 MB | **46%** |
+| **PowerShell 7.4** | ~550 MB | ~280 MB | **49%** |
+| **.NET 8 Isolated** | ~450 MB | ~250 MB | **44%** |
+
+### Impact on Pull Times and Cold Start
+
+Smaller images mean faster container provisioning:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Container Image Pull Time (100 Mbps network)                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Current Model (Python):                                                │
+│  530 MB ÷ 12.5 MB/s = ~42 seconds                                       │
+│                                                                         │
+│  New Model (Python Worker):                                             │
+│  270 MB ÷ 12.5 MB/s = ~22 seconds                                       │
+│                                                                         │
+│  Savings: ~20 seconds per cold start                                    │
+│                                                                         │
+│  With pre-pulled Runtime image:                                         │
+│  Only worker image needs pulling = ~22 seconds                          │
+│  Runtime already cached on node = 0 seconds                             │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Additional Benefits
+
+#### 1. Faster Build Times
+
+Without .NET dependencies, worker images build faster:
+
+```dockerfile
+# Current: Must include .NET SDK for build
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+# ... build host components ...
+
+FROM mcr.microsoft.com/azure-functions/python:4.0
+# Copy host + worker
+
+# New: Pure Python image
+FROM python:3.11-slim
+COPY worker /worker
+RUN pip install -r requirements.txt
+```
+
+#### 2. Reduced Security Surface
+
+Fewer components = fewer potential vulnerabilities:
+
+| Component | CVE Exposure |
+|-----------|--------------|
+| .NET Runtime | Periodic security updates required |
+| Functions Host | Azure Functions-specific patches |
+| WebJobs SDK | Dependency chain vulnerabilities |
+
+**New Model**: Python worker only needs Python security updates.
+
+#### 3. Simpler Debugging
+
+Developers can work with familiar, single-language containers:
+
+```bash
+# Current: Debugging requires understanding .NET + Python
+docker exec -it func-container bash
+# Where's the error? Host? Worker? gRPC?
+
+# New: Pure Python environment
+docker exec -it python-worker bash
+# Standard Python debugging tools work as expected
+```
+
+#### 4. Language Team Autonomy
+
+Each language team can own their worker image independently:
+
+| Team | Responsibility |
+|------|----------------|
+| **Runtime Team** | Functions Host image with .NET |
+| **Python Team** | Python worker image (no .NET knowledge needed) |
+| **Node.js Team** | Node worker image (pure JavaScript/TypeScript) |
+| **Java Team** | Java worker image (JVM-only) |
+
+### Summary: Image Simplification
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Current: Every language includes .NET + Host                           │
+│                                                                         │
+│  Python:  [OS] + [.NET] + [Host] + [Python] + [Worker]                 │
+│  Node:    [OS] + [.NET] + [Host] + [Node]   + [Worker]                 │
+│  Java:    [OS] + [.NET] + [Host] + [JVM]    + [Worker]                 │
+│                                                                         │
+│  ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓          │
+│                                                                         │
+│  New: Separation of concerns                                            │
+│                                                                         │
+│  Runtime: [OS] + [.NET] + [Host]           (shared, cached)            │
+│  Python:  [OS] + [Python] + [Worker] + [Sidecar]                       │
+│  Node:    [OS] + [Node]   + [Worker] + [Sidecar]                       │
+│  Java:    [OS] + [JVM]    + [Worker] + [Sidecar]                       │
+│                                                                         │
+│  Benefits:                                                              │
+│  - 44-58% smaller worker images                                         │
+│  - ~20s faster cold starts (image pull)                                 │
+│  - Simpler, language-native containers                                  │
+│  - Reduced security surface                                             │
+│  - Independent team ownership                                           │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## Changes Required in New Design
 
 ### Change 1: Worker Process Management

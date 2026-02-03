@@ -198,19 +198,18 @@ flowchart LR
         
         FunctionRpc["FunctionRpc Service"]
         
-        subgraph MessageRouting["Message Routing Layer"]
-            WorkerToJobHostRouter["Worker→JobHost Router"]
-            JobHostToWorkerRouter["JobHost→Worker Router"]
+        subgraph JobHostMgr["Unified JobHostManager"]
+            direction TB
+            Routing["Worker Routing Table"]
+            JobHost1["JobHost 1<br/>Channel Reader"]
+            JobHost2["JobHost 2<br/>Channel Reader"]
+            Routing --> JobHost1
+            Routing --> JobHost2
         end
         
-        subgraph JobHosts["JobHost Manager"]
-            JobHost1["JobHost 1<br/>Channel Reader/Writer"]
-            JobHost2["JobHost 2<br/>Channel Reader/Writer"]
-        end
+        JobHostToWorkerRouter["JobHost→Worker Router"]
         
-        FunctionRpc --> WorkerToJobHostRouter
-        WorkerToJobHostRouter --> JobHost1
-        WorkerToJobHostRouter --> JobHost2
+        FunctionRpc --> Routing
         
         JobHost1 --> JobHostToWorkerRouter
         JobHost2 --> JobHostToWorkerRouter
@@ -221,52 +220,28 @@ flowchart LR
     Worker2 <--> FunctionRpc
 ```
 
+> **Design Note**: The `JobHostManager` combines both JobHost lifecycle management and worker-to-JobHost message routing into a single component. This enables atomic routing cutover during specialization and eliminates state synchronization issues between separate router and manager classes. See [Channel Routing During Specialization](#channel-routing-during-specialization) for full details.
+
 ### Message Flow: Worker → JobHost
 
-When a message arrives from a worker via gRPC, it must be routed to the correct JobHost:
+When a message arrives from a worker via gRPC, it must be routed to the correct JobHost. This routing is handled by `JobHostManager.RouteMessageAsync()` (see [Channel Routing During Specialization](#channel-routing-during-specialization) for the unified design):
 
 ```csharp
-public class WorkerToJobHostRouter
-{
-    // Each JobHost has a dedicated channel for receiving messages from workers
-    private readonly ConcurrentDictionary<string, ChannelWriter<WorkerMessage>> _jobHostChannels = new();
-    
-    public void RegisterJobHost(ApplicationDefinition appDef, ChannelWriter<WorkerMessage> channelWriter)
-    {
-        var key = appDef.GetKey();
-        _jobHostChannels[key] = channelWriter;
-    }
-    
-    public async Task RouteMessageToJobHostAsync(WorkerMessage message, CancellationToken cancellationToken)
-    {
-        // Determine target JobHost based on message context (FunctionId, InvocationId, etc.)
-        var appDef = await DetermineTargetApplicationAsync(message);
-        var key = appDef.GetKey();
-        
-        if (_jobHostChannels.TryGetValue(key, out var channelWriter))
-        {
-            await channelWriter.WriteAsync(message, cancellationToken);
-        }
-        else
-        {
-            throw new InvalidOperationException(
-                $"No JobHost found for application {appDef}");
-        }
-    }
-    
-    private async Task<ApplicationDefinition> DetermineTargetApplicationAsync(WorkerMessage message)
-    {
-        // Based on message type, determine which application/JobHost should handle it
-        return message.MessageType switch
-        {
-            MessageType.InvocationResponse => await GetApplicationByInvocationIdAsync(message.InvocationId),
-            MessageType.FunctionLoadResponse => await GetApplicationByFunctionIdAsync(message.FunctionId),
-            MessageType.WorkerInitResponse => await GetApplicationByWorkerIdAsync(message.WorkerId),
-            _ => throw new NotSupportedException($"Unknown message type: {message.MessageType}")
-        };
-    }
-}
+// Simplified view - routing is integrated into JobHostManager
+// Worker registration creates the routing entry
+await _jobHostManager.RegisterWorkerRoutingAsync(workerId, jobHostKey, ct);
 
+// Messages are routed via the unified interface
+await _jobHostManager.RouteMessageAsync(workerId, message, ct);
+
+// During specialization, routing switches atomically
+await _jobHostManager.SwitchWorkerRoutingAsync(
+    workerId, fromJobHostKey, toJobHostKey, ct);
+```
+
+### Message Types Handled
+
+```csharp
 public class WorkerMessage
 {
     public string MessageId { get; set; }
@@ -487,6 +462,484 @@ public class FunctionRpcService : FunctionRpc.FunctionRpcBase
 4. **Performance**: Efficient, lock-free message passing
 5. **Cancellation**: Built-in support for cancellation tokens
 6. **Multi-Tenant Isolation**: Each JobHost has dedicated channels preventing cross-tenant communication
+
+---
+
+## Channel Routing During Specialization
+
+### The Problem
+
+During specialization, we need to:
+1. **Shut down** the Placeholder JobHost
+2. **Start** a new Customer JobHost
+3. **Transfer** the worker's channel to the new JobHost
+
+The challenge is that these operations happen in parallel. The Placeholder JobHost may still be reading from the channel while we're setting up the new JobHost. If we're not careful:
+- Messages could be lost during the transition
+- The Placeholder JobHost could process messages meant for the Customer JobHost
+- Race conditions could cause unexpected behavior
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  The Problem: Parallel Shutdown and Startup                             │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Time ─────────────────────────────────────────────────────────────►    │
+│                                                                         │
+│  Placeholder JobHost:  [────Reading from Channel────][Shutdown]         │
+│                                                      ↑                  │
+│                                                      │ Race condition!  │
+│                                                      │ Who owns channel?│
+│  Customer JobHost:                        [Starting][Reading Channel]   │
+│                                                                         │
+│  Worker Messages:     ──►M1──►M2──►M3──►M4──►M5──►M6──►M7──►            │
+│                                         ↑                               │
+│                                         │                               │
+│                              Which JobHost receives M4, M5, M6?         │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Solution: Unified JobHostManager with Integrated Routing
+
+Rather than having separate `WorkerChannelRouter` and `JobHostManager` classes, we combine them into a single `JobHostManager` that owns both:
+1. **JobHost lifecycle** (create, start, stop)
+2. **Worker-to-JobHost routing** (message forwarding, cutover during specialization)
+
+This design ensures:
+- **Single source of truth** for JobHost state and routing
+- **Atomic operations** during specialization (create JobHost + switch routing in one operation)
+- **Simpler coordination** - no need to keep separate classes in sync
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Unified JobHostManager Architecture                                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  gRPC Layer (Worker Connections)                                 │   │
+│  │  Worker 1 ──────┐                                                │   │
+│  │  Worker 2 ──────┼─► Messages                                     │   │
+│  │  Worker 3 ──────┘                                                │   │
+│  └────────────────────────────┬────────────────────────────────────┘   │
+│                               │                                         │
+│                               ▼                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  JobHostManager                                                  │   │
+│  │  ┌───────────────────────────────────────────────────────────┐  │   │
+│  │  │  JobHost Registry (lifecycle management)                   │  │   │
+│  │  │  - CreateJobHostAsync() / GetOrCreateJobHostAsync()       │  │   │
+│  │  │  - StopJobHostAsync()                                      │  │   │
+│  │  │  - GetJobHostAsync()                                       │  │   │
+│  │  ├───────────────────────────────────────────────────────────┤  │   │
+│  │  │  Worker Routing Table (per-worker → JobHost mapping)       │  │   │
+│  │  │  - RegisterWorkerRouting()                                 │  │   │
+│  │  │  - RouteMessageAsync()                                     │  │   │
+│  │  │  - SwitchWorkerRoutingAsync() ← Atomic cutover            │  │   │
+│  │  └───────────────────────────────────────────────────────────┘  │   │
+│  └───────────────┬──────────────────────────────────┬──────────────┘   │
+│                  │                                  │                   │
+│                  ▼                                  ▼                   │
+│  ┌─────────────────────────────┐    ┌─────────────────────────────┐   │
+│  │  Placeholder JobHost        │    │  Customer JobHost           │   │
+│  │  (owns its Channel)         │    │  (owns its Channel)         │   │
+│  └─────────────────────────────┘    └─────────────────────────────┘   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### JobHostManager: Combined Interface
+
+```csharp
+public interface IJobHostManager
+{
+    // ═══════════════════════════════════════════════════════════════════
+    // JobHost Lifecycle Management
+    // ═══════════════════════════════════════════════════════════════════
+    
+    /// <summary>
+    /// Creates a new JobHost for an application's metadata version.
+    /// Returns existing JobHost if one exists for the same metadata version.
+    /// </summary>
+    Task<JobHost> GetOrCreateJobHostAsync(JobHostConfiguration config);
+    
+    /// <summary>
+    /// Gets a JobHost by its key (ApplicationId:MetadataVersion)
+    /// </summary>
+    Task<JobHost?> GetJobHostAsync(string jobHostKey);
+    
+    Task<IEnumerable<JobHost>> GetAllJobHostsAsync();
+    
+    Task StopJobHostAsync(string jobHostKey);
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // Worker-to-JobHost Routing
+    // ═══════════════════════════════════════════════════════════════════
+    
+    /// <summary>
+    /// Register a worker's initial routing to a JobHost.
+    /// Called when worker first connects or during specialization.
+    /// </summary>
+    Task RegisterWorkerRoutingAsync(
+        string workerId,
+        string jobHostKey,
+        CancellationToken cancellationToken);
+    
+    /// <summary>
+    /// Route a message from a worker to its assigned JobHost.
+    /// </summary>
+    ValueTask RouteMessageAsync(
+        string workerId,
+        WorkerMessage message,
+        CancellationToken cancellationToken);
+    
+    /// <summary>
+    /// Atomically switch a worker's routing from one JobHost to another.
+    /// Used during specialization to cutover from Placeholder to Customer JobHost.
+    /// Handles: draining pending messages, completing old channel, starting new routing.
+    /// </summary>
+    Task SwitchWorkerRoutingAsync(
+        string workerId,
+        string fromJobHostKey,
+        string toJobHostKey,
+        CancellationToken cancellationToken);
+    
+    /// <summary>
+    /// Remove a worker's routing (worker disconnected).
+    /// </summary>
+    Task UnregisterWorkerAsync(string workerId);
+}
+```
+
+### JobHostManager Implementation
+
+```csharp
+public class JobHostManager : IJobHostManager
+{
+    // ═══════════════════════════════════════════════════════════════════
+    // State
+    // ═══════════════════════════════════════════════════════════════════
+    
+    // JobHost registry: keyed by ApplicationId:MetadataVersion
+    private readonly ConcurrentDictionary<string, JobHostEntry> _jobHosts = new();
+    
+    // Worker routing: keyed by WorkerId
+    private readonly ConcurrentDictionary<string, WorkerRoutingEntry> _workerRouting = new();
+    
+    private readonly ILogger<JobHostManager> _logger;
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // JobHost Lifecycle
+    // ═══════════════════════════════════════════════════════════════════
+    
+    public async Task<JobHost> GetOrCreateJobHostAsync(JobHostConfiguration config)
+    {
+        var appDef = config.ApplicationDefinition;
+        var jobHostKey = appDef.GetJobHostKey();
+        
+        // Check for existing
+        if (_jobHosts.TryGetValue(jobHostKey, out var existing))
+        {
+            _logger.LogInformation(
+                "Reusing existing JobHost {JobHostKey}",
+                jobHostKey);
+            return existing.JobHost;
+        }
+        
+        // Create new JobHost with its own inbound channel
+        var inboundChannel = Channel.CreateBounded<WorkerMessage>(
+            new BoundedChannelOptions(1000)
+            {
+                SingleReader = true,
+                SingleWriter = false,
+                FullMode = BoundedChannelFullMode.Wait
+            });
+        
+        var jobHost = new JobHost(config, inboundChannel.Reader, _logger);
+        
+        var entry = new JobHostEntry
+        {
+            JobHostKey = jobHostKey,
+            JobHost = jobHost,
+            InboundChannel = inboundChannel,
+            ApplicationDefinition = appDef,
+            CreatedAt = DateTimeOffset.UtcNow
+        };
+        
+        if (!_jobHosts.TryAdd(jobHostKey, entry))
+        {
+            // Another thread created it first
+            return _jobHosts[jobHostKey].JobHost;
+        }
+        
+        // Start the JobHost
+        await jobHost.StartAsync(CancellationToken.None);
+        
+        _logger.LogInformation(
+            "Created and started JobHost {JobHostKey}",
+            jobHostKey);
+        
+        return jobHost;
+    }
+    
+    public async Task StopJobHostAsync(string jobHostKey)
+    {
+        if (!_jobHosts.TryRemove(jobHostKey, out var entry))
+        {
+            _logger.LogWarning(
+                "Attempted to stop non-existent JobHost {JobHostKey}",
+                jobHostKey);
+            return;
+        }
+        
+        // Complete the inbound channel - signals JobHost to stop processing
+        entry.InboundChannel.Writer.Complete();
+        
+        // Stop the JobHost
+        await entry.JobHost.StopAsync(CancellationToken.None);
+        
+        _logger.LogInformation(
+            "Stopped JobHost {JobHostKey}",
+            jobHostKey);
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // Worker Routing
+    // ═══════════════════════════════════════════════════════════════════
+    
+    public Task RegisterWorkerRoutingAsync(
+        string workerId,
+        string jobHostKey,
+        CancellationToken cancellationToken)
+    {
+        if (!_jobHosts.TryGetValue(jobHostKey, out var jobHostEntry))
+        {
+            throw new InvalidOperationException(
+                $"Cannot register routing: JobHost {jobHostKey} not found");
+        }
+        
+        var routingEntry = new WorkerRoutingEntry
+        {
+            WorkerId = workerId,
+            CurrentJobHostKey = jobHostKey,
+            ChannelWriter = jobHostEntry.InboundChannel.Writer,
+            PendingMessages = Channel.CreateBounded<WorkerMessage>(100)
+        };
+        
+        _workerRouting[workerId] = routingEntry;
+        
+        _logger.LogInformation(
+            "Registered worker {WorkerId} routing to JobHost {JobHostKey}",
+            workerId,
+            jobHostKey);
+        
+        return Task.CompletedTask;
+    }
+    
+    public async ValueTask RouteMessageAsync(
+        string workerId,
+        WorkerMessage message,
+        CancellationToken cancellationToken)
+    {
+        if (!_workerRouting.TryGetValue(workerId, out var routingEntry))
+        {
+            _logger.LogWarning(
+                "No routing entry for worker {WorkerId}, dropping message {MessageId}",
+                workerId,
+                message.MessageId);
+            return;
+        }
+        
+        // Route to the worker's currently assigned JobHost channel
+        try
+        {
+            await routingEntry.ChannelWriter.WriteAsync(message, cancellationToken);
+        }
+        catch (ChannelClosedException)
+        {
+            // Channel was closed during cutover - queue for later
+            await routingEntry.PendingMessages.Writer.WriteAsync(message, cancellationToken);
+        }
+    }
+    
+    public async Task SwitchWorkerRoutingAsync(
+        string workerId,
+        string fromJobHostKey,
+        string toJobHostKey,
+        CancellationToken cancellationToken)
+    {
+        if (!_workerRouting.TryGetValue(workerId, out var routingEntry))
+        {
+            throw new InvalidOperationException(
+                $"Cannot switch routing: Worker {workerId} not registered");
+        }
+        
+        if (routingEntry.CurrentJobHostKey != fromJobHostKey)
+        {
+            throw new InvalidOperationException(
+                $"Worker {workerId} not routed to {fromJobHostKey} (currently: {routingEntry.CurrentJobHostKey})");
+        }
+        
+        if (!_jobHosts.TryGetValue(toJobHostKey, out var newJobHostEntry))
+        {
+            throw new InvalidOperationException(
+                $"Cannot switch routing: Target JobHost {toJobHostKey} not found");
+        }
+        
+        _logger.LogInformation(
+            "Switching worker {WorkerId} routing: {FromJobHost} → {ToJobHost}",
+            workerId,
+            fromJobHostKey,
+            toJobHostKey);
+        
+        // Get old channel writer for completion
+        var oldChannelWriter = routingEntry.ChannelWriter;
+        
+        // Atomic switch to new channel
+        routingEntry.ChannelWriter = newJobHostEntry.InboundChannel.Writer;
+        routingEntry.CurrentJobHostKey = toJobHostKey;
+        
+        // Drain any pending messages to new JobHost
+        while (routingEntry.PendingMessages.Reader.TryRead(out var pendingMessage))
+        {
+            await routingEntry.ChannelWriter.WriteAsync(pendingMessage, cancellationToken);
+        }
+        
+        // Complete old channel (signals old JobHost to finish processing)
+        // Note: We don't complete if other workers are still using this JobHost
+        var workersOnOldJobHost = _workerRouting.Values
+            .Count(r => r.CurrentJobHostKey == fromJobHostKey);
+        
+        if (workersOnOldJobHost == 0)
+        {
+            _logger.LogDebug(
+                "No workers remaining on JobHost {JobHostKey}, can be stopped",
+                fromJobHostKey);
+            // Caller should call StopJobHostAsync if appropriate
+        }
+        
+        _logger.LogInformation(
+            "Worker {WorkerId} routing switched to JobHost {ToJobHost}",
+            workerId,
+            toJobHostKey);
+    }
+    
+    public Task UnregisterWorkerAsync(string workerId)
+    {
+        if (_workerRouting.TryRemove(workerId, out var entry))
+        {
+            _logger.LogInformation(
+                "Unregistered worker {WorkerId} (was routed to {JobHostKey})",
+                workerId,
+                entry.CurrentJobHostKey);
+        }
+        
+        return Task.CompletedTask;
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // Internal Types
+    // ═══════════════════════════════════════════════════════════════════
+    
+    private class JobHostEntry
+    {
+        public string JobHostKey { get; set; }
+        public JobHost JobHost { get; set; }
+        public Channel<WorkerMessage> InboundChannel { get; set; }
+        public ApplicationDefinition ApplicationDefinition { get; set; }
+        public DateTimeOffset CreatedAt { get; set; }
+    }
+    
+    private class WorkerRoutingEntry
+    {
+        public string WorkerId { get; set; }
+        public string CurrentJobHostKey { get; set; }
+        public ChannelWriter<WorkerMessage> ChannelWriter { get; set; }
+        public Channel<WorkerMessage> PendingMessages { get; set; }
+    }
+}
+```
+
+### Specialization Flow with Unified JobHostManager
+
+The specialization process is simplified because one component handles everything:
+
+```csharp
+public class SpecializationOrchestrator
+{
+    private readonly IJobHostManager _jobHostManager;
+    
+    public async Task SpecializeWorkerAsync(
+        WorkerState worker,
+        ApplicationDefinition customerApp,
+        CancellationToken cancellationToken)
+    {
+        var placeholderJobHostKey = worker.JobHostKey;
+        var customerJobHostKey = customerApp.GetJobHostKey();
+        
+        _logger.LogInformation(
+            "Specializing worker {WorkerId}: {PlaceholderJobHost} → {CustomerJobHost}",
+            worker.WorkerId,
+            placeholderJobHostKey,
+            customerJobHostKey);
+        
+        // Step 1: Create Customer JobHost (JobHostManager handles channel creation)
+        var customerJobHost = await _jobHostManager.GetOrCreateJobHostAsync(
+            new JobHostConfiguration
+            {
+                ApplicationDefinition = customerApp,
+                // ... other config
+            });
+        
+        // Step 2: Atomic routing switch (JobHostManager handles channel cutover)
+        await _jobHostManager.SwitchWorkerRoutingAsync(
+            worker.WorkerId,
+            fromJobHostKey: placeholderJobHostKey,
+            toJobHostKey: customerJobHostKey,
+            cancellationToken);
+        
+        // Step 3: Update worker state
+        worker.JobHostKey = customerJobHostKey;
+        worker.ApplicationDefinition = customerApp;
+        worker.IsPlaceholder = false;
+        
+        // Step 4: Check if Placeholder JobHost can be stopped
+        // (only if no other workers are using it)
+        var placeholderJobHost = await _jobHostManager.GetJobHostAsync(placeholderJobHostKey);
+        if (placeholderJobHost != null && !HasActiveWorkers(placeholderJobHostKey))
+        {
+            await _jobHostManager.StopJobHostAsync(placeholderJobHostKey);
+        }
+        
+        _logger.LogInformation(
+            "Specialization complete. Worker {WorkerId} now serving {AppId}",
+            worker.WorkerId,
+            customerApp.ApplicationId);
+    }
+}
+```
+
+### Benefits of Unified Design
+
+| Aspect | Separate Classes | Unified JobHostManager |
+|--------|-----------------|------------------------|
+| **State consistency** | Must keep router + manager in sync | Single source of truth |
+| **Atomic operations** | Requires coordination | Built-in atomicity |
+| **Specialization** | Multiple components involved | Single method call |
+| **Testing** | Mock multiple dependencies | Mock one interface |
+| **Code complexity** | More indirection | Direct, clear flow |
+| **Debugging** | State split across classes | All state in one place |
+
+### Message Ordering Guarantees
+
+The unified design preserves all message ordering guarantees:
+
+| Guarantee | How It's Achieved |
+|-----------|-------------------|
+| **No message loss** | Pending queue captures messages during switch |
+| **No duplicate delivery** | Atomic channel writer swap |
+| **Ordering preserved** | Single-writer channel + sequential drain |
+| **Clean shutdown** | Channel completion on JobHost stop |
 
 ---
 
@@ -1241,109 +1694,18 @@ public async Task DeployBlueGreenAsync(
 
 ### JobHost Manager
 
-The JobHost Manager is updated to support the versioning model - JobHosts are keyed by `ApplicationId:MetadataVersion`, allowing multiple code versions to share a JobHost.
+The JobHost Manager is the central component for managing both JobHost lifecycle AND worker-to-JobHost routing. It uses the unified `IJobHostManager` interface defined in the [Channel Routing During Specialization](#channel-routing-during-specialization) section.
+
+Key responsibilities:
+- **JobHost Lifecycle**: Create, start, and stop JobHosts (keyed by `ApplicationId:MetadataVersion`)
+- **Worker Routing**: Register workers, route messages, and atomically switch routing during specialization
+- **Blue/Green Support**: Multiple code versions can share a JobHost when only `CodeVersion` differs
+
+See the `JobHostManager` implementation above for the full combined interface.
+
+### JobHost Configuration
 
 ```csharp
-public interface IJobHostManager
-{
-    /// <summary>
-    /// Creates a new JobHost for an application's metadata version.
-    /// Returns existing JobHost if one exists for the same metadata version.
-    /// </summary>
-    Task<JobHost> GetOrCreateJobHostAsync(JobHostConfiguration config);
-    
-    /// <summary>
-    /// Gets a JobHost by its key (ApplicationId:MetadataVersion)
-    /// </summary>
-    Task<JobHost?> GetJobHostAsync(string jobHostKey);
-    
-    Task<IEnumerable<JobHost>> GetAllJobHostsAsync();
-    Task StopJobHostAsync(string jobHostKey);
-}
-
-public class JobHostManager : IJobHostManager
-{
-    // Keyed by ApplicationId:MetadataVersion (not CodeVersion)
-    private readonly ConcurrentDictionary<string, JobHost> _jobHosts = new();
-    private readonly IInvocationRouter _router;
-    private readonly ILogger<JobHostManager> _logger;
-    
-    public async Task<JobHost> GetOrCreateJobHostAsync(JobHostConfiguration config)
-    {
-        var appDefinition = config.ApplicationDefinition ?? 
-            throw new ArgumentNullException(nameof(config.ApplicationDefinition));
-        
-        // Key is based on MetadataVersion only - CodeVersion can vary
-        var jobHostKey = appDefinition.GetJobHostKey();
-        
-        // Check for existing JobHost that can be reused
-        if (_jobHosts.TryGetValue(jobHostKey, out var existingJobHost))
-        {
-            _logger.LogInformation(
-                "Reusing existing JobHost for {AppId}:{MetadataVersion}, " +
-                "new CodeVersion: {CodeVersion}",
-                appDefinition.ApplicationId,
-                appDefinition.MetadataVersion,
-                appDefinition.CodeVersion);
-            
-            return existingJobHost;
-        }
-        
-        // Create new JobHost for this metadata version
-        var jobHost = new JobHost(config, _router, _logger);
-        
-        // Start the JobHost (initializes WebJobs SDK and starts all listeners)
-        await jobHost.StartAsync(CancellationToken.None);
-        
-        if (!_jobHosts.TryAdd(jobHostKey, jobHost))
-        {
-            // Another thread created it - stop ours and use theirs
-            await jobHost.StopAsync(CancellationToken.None);
-            jobHost.Dispose();
-            return _jobHosts[jobHostKey];
-        }
-        
-        _logger.LogInformation(
-            "Created new JobHost for {AppId}:{MetadataVersion} with {TriggerCount} triggers",
-            appDefinition.ApplicationId, 
-            appDefinition.MetadataVersion, 
-            config.Triggers?.Count ?? 0);
-        
-        return jobHost;
-    }
-    
-    public async Task StopJobHostAsync(string jobHostKey)
-    {
-        if (_jobHosts.TryRemove(jobHostKey, out var jobHost))
-        {
-            await jobHost.StopAsync(CancellationToken.None);
-            jobHost.Dispose();
-            
-            _logger.LogInformation("Stopped JobHost {JobHostKey}", jobHostKey);
-        }
-    }
-    
-    public Task<JobHost?> GetJobHostAsync(string jobHostKey)
-    {
-        _jobHosts.TryGetValue(jobHostKey, out var jobHost);
-        return Task.FromResult(jobHost);
-    }
-    
-    public Task<IEnumerable<JobHost>> GetAllJobHostsAsync()
-    {
-        return Task.FromResult<IEnumerable<JobHost>>(_jobHosts.Values);
-    }
-}
-
-public class JobHostConfiguration
-{
-    public ApplicationDefinition ApplicationDefinition { get; set; }
-    public string? CustomerId { get; set; }
-    public Dictionary<string, string> ConnectionStrings { get; set; }
-    public List<TriggerConfiguration> Triggers { get; set; }
-    public Dictionary<string, string> EnvironmentVariables { get; set; }
-}
-
 public class JobHostConfiguration
 {
     public ApplicationDefinition ApplicationDefinition { get; set; }
