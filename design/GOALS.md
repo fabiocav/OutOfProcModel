@@ -1152,6 +1152,210 @@ public async Task AssignWorkerToAppAsync(ApplicationDefinition appDef)
 
 ---
 
+## Rollout Strategy: Transparent Migration with Versioned SKUs
+
+### Goal: Invisible Migration for Most Customers
+
+The primary rollout goal is to migrate customers to the new model **without them noticing**. For the vast majority of customers who use default configurations:
+
+- No code changes required
+- No configuration changes required
+- No behavior changes (functions execute identically)
+- Performance should improve (faster cold starts, better scaling)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Migration Spectrum                                                     │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  95% of customers                          5% of customers              │
+│  ──────────────────                        ───────────────              │
+│  Default configurations                    Custom configurations        │
+│  Standard triggers                         IWebJobsConfigurationStartup │
+│  No worker customization                   Custom worker arguments      │
+│                                            Process count overrides      │
+│          │                                          │                   │
+│          ▼                                          ▼                   │
+│  ┌─────────────────────┐                  ┌─────────────────────┐      │
+│  │  Transparent        │                  │  May require        │      │
+│  │  Migration          │                  │  opt-in or          │      │
+│  │                     │                  │  migration work     │      │
+│  │  • No action needed │                  │                     │      │
+│  │  • Auto-migrated    │                  │  • Review settings  │      │
+│  │  • Better perf      │                  │  • Choose SKU       │      │
+│  └─────────────────────┘                  └─────────────────────┘      │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Proposal: Versioned Instance SKUs
+
+Inspired by VM SKU versioning (e.g., `Standard_D2s_v3` vs `Standard_D2s_v5`), we propose **versioned instance sizes** that allow customers to explicitly choose the execution model:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Versioned Instance SKUs                                                │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Current SKUs (v1 - Legacy Model):                                      │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  EP1     │  EP2     │  EP3     │  Y1 (Consumption)              │   │
+│  │  1 core  │  2 cores │  4 cores │  Dynamic                       │   │
+│  │  3.5 GB  │  7 GB    │  14 GB   │                                │   │
+│  │                                                                  │   │
+│  │  Behavior:                                                       │   │
+│  │  • Runtime + Worker coupled                                      │   │
+│  │  • IConfiguration overrides supported                            │   │
+│  │  • Full backward compatibility                                   │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  New SKUs (v2 - Decoupled Model):                                       │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  EP1v2   │  EP2v2   │  EP3v2   │  Y1v2 (Consumption)            │   │
+│  │  1 core  │  2 cores │  4 cores │  Dynamic                       │   │
+│  │  3.5 GB  │  7 GB    │  14 GB   │                                │   │
+│  │                                                                  │   │
+│  │  Behavior:                                                       │   │
+│  │  • Runtime + Worker decoupled                                    │   │
+│  │  • Faster cold starts                                            │   │
+│  │  • Improved scaling (partition fan-out)                          │   │
+│  │  • Some legacy features deprecated (see below)                   │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Benefits of Versioned SKUs
+
+| Benefit | Description |
+|---------|-------------|
+| **Explicit opt-in** | Customers choose when to adopt new model |
+| **Clear expectations** | v2 SKUs have documented behavior differences |
+| **Safe rollback** | Customers can switch back to v1 if issues arise |
+| **Deprecation path** | Legacy features can be marked "v1 only" |
+| **A/B testing** | Easy to compare performance between models |
+| **Gradual migration** | Default new apps to v2, existing apps stay v1 |
+
+### Features to Deprecate or Change in v2
+
+The v2 model provides an opportunity to clean up technical debt and remove features that don't align with the decoupled architecture:
+
+| Feature | v1 Behavior | v2 Behavior | Rationale |
+|---------|-------------|-------------|-----------|
+| **IConfiguration worker overrides** | `IWebJobsConfigurationStartup` can modify worker args | Not supported | Causes expensive restart detection; use App Settings instead |
+| **Custom worker arguments via code** | Extensions can inject worker args | App Settings only | Sidecar can detect App Settings; can't detect code changes |
+| **Process count override** | `FUNCTIONS_WORKER_PROCESS_COUNT` supported | Ignored (Runtime controls) | Worker scaling is Runtime's responsibility |
+| **In-process .NET** | Supported | Not supported | Already on deprecation path |
+| **Local file system access** | Workers can access Runtime's file system | Isolated file systems | Containers are separate |
+
+### Proposed Deprecation Messages
+
+```csharp
+// When customer uses deprecated feature on v2 SKU
+public class V2CompatibilityChecker
+{
+    public void ValidateConfiguration(FunctionAppConfiguration config)
+    {
+        if (config.HasIWebJobsConfigurationStartup && config.IsV2Sku)
+        {
+            _logger.LogWarning(
+                "IWebJobsConfigurationStartup is not supported on v2 SKUs. " +
+                "Worker configuration overrides should be set via App Settings. " +
+                "See https://aka.ms/functions-v2-migration for details.");
+        }
+        
+        if (config.HasWorkerProcessCountOverride && config.IsV2Sku)
+        {
+            _logger.LogWarning(
+                "FUNCTIONS_WORKER_PROCESS_COUNT is ignored on v2 SKUs. " +
+                "Worker scaling is managed by the platform. " +
+                "Use maxWorkersPerRuntime in host.json for fine-grained control.");
+        }
+    }
+}
+```
+
+### Rollout Phases
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Phased Rollout Plan                                                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Phase 1: Preview (Month 1-3)                                           │
+│  ────────────────────────────                                           │
+│  • v2 SKUs available in portal as "Preview"                             │
+│  • Opt-in only, no automatic migration                                  │
+│  • Target: Early adopters, internal teams                               │
+│  • Gather telemetry, fix issues                                         │
+│                                                                         │
+│  Phase 2: GA v2 SKUs (Month 4-6)                                        │
+│  ───────────────────────────────                                        │
+│  • v2 SKUs generally available                                          │
+│  • New Function Apps default to v2                                      │
+│  • Existing apps remain on v1 (no auto-migration)                       │
+│  • Documentation and migration guides published                         │
+│                                                                         │
+│  Phase 3: Transparent Migration (Month 7-12)                            │
+│  ────────────────────────────────────────────                           │
+│  • Analyze existing v1 apps for compatibility                           │
+│  • Auto-migrate compatible apps to v2 during maintenance                │
+│  • Notify customers of incompatible apps                                │
+│  • Provide tools to identify required changes                           │
+│                                                                         │
+│  Phase 4: v1 Deprecation (Month 13-18)                                  │
+│  ─────────────────────────────────────                                  │
+│  • Announce v1 deprecation timeline                                     │
+│  • v1 enters "maintenance mode" (security fixes only)                   │
+│  • Premium support for v1 migration assistance                          │
+│  • New apps cannot select v1 SKUs                                       │
+│                                                                         │
+│  Phase 5: v1 End of Life (Month 24+)                                    │
+│  ────────────────────────────────────                                   │
+│  • v1 SKUs retired                                                      │
+│  • Remaining v1 apps force-migrated or unsupported                      │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Compatibility Detection Tool
+
+Provide customers with a tool to check if their app is v2-compatible:
+
+```bash
+# CLI tool to check v2 compatibility
+func v2-compat check --resource-group myRg --name myFunctionApp
+
+# Output:
+┌─────────────────────────────────────────────────────────────────────────┐
+│  v2 Compatibility Report: myFunctionApp                                 │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ✅ Runtime: python 3.11 (supported)                                    │
+│  ✅ Triggers: HTTP, Queue, Timer (supported)                            │
+│  ✅ Bindings: Blob, Table (supported)                                   │
+│  ✅ Worker arguments: default (no custom args)                          │
+│                                                                         │
+│  ⚠️  Warnings:                                                          │
+│  • FUNCTIONS_WORKER_PROCESS_COUNT=4 will be ignored on v2               │
+│    Recommendation: Remove setting, platform manages worker count        │
+│                                                                         │
+│  Overall: COMPATIBLE ✅                                                  │
+│  Migration command: az functionapp update --sku EP1v2                   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Open Questions
+
+1. **SKU naming**: Should we use `v2` suffix or something else (e.g., `EP1-next`, `EP1-flex`)?
+2. **Pricing**: Should v2 SKUs have the same pricing as v1?
+3. **Default for new apps**: When should new apps default to v2?
+4. **Forced migration**: Should we ever force-migrate apps, or always require explicit opt-in?
+5. **Feature flags**: Should we allow v2 features on v1 SKUs via feature flags for testing?
+
+---
+
 ## Conclusion
 
 The new Worker Model represents a fundamental architectural improvement that:

@@ -1703,6 +1703,29 @@ public class ColdStartBenchmark
 
 **Proposal**: Use distributed state store (Redis, Cosmos DB) with optimistic concurrency.
 
+### 9. Abandoned Workers After Specialization
+
+**Question**: What happens to workers left on a Placeholder Runtime after one of its workers is specialized?
+
+**Scenario**: A Placeholder Runtime has 5 workers. One worker gets specialized and transferred to a Customer JobHost. What happens to the remaining 4 workers?
+
+**Options**:
+
+| Option | Description | Pros | Cons |
+|--------|-------------|------|------|
+| **A) Re-assign to another Placeholder** | Workers connect to a different Placeholder Runtime | Workers stay warm; can serve other customers | Requires worker re-connection logic; may have language mismatch |
+| **B) Eligible for 1→N scale-out** | Abandoned workers can be claimed by other apps needing scale-out | Maximizes worker reuse; faster scale-out for other customers | Adds complexity to worker claiming; security boundary concerns |
+| **C) Sit idle for reclamation** | Workers stay connected to dying Placeholder; reclaimed when new Placeholder spins up | Simple; no re-connection needed | Workers sit idle; wasted resources until reclaimed |
+| **D) Terminate immediately** | Placeholder Runtime stops all remaining workers when first specialization occurs | Clean slate; simple model | Wastes warm workers; defeats purpose of placeholder pooling |
+
+**Considerations**:
+- If Runtime becomes "dedicated" after first specialization (see Question #2), what happens to remaining workers on the old Placeholder?
+- Can workers safely connect to a *different* Runtime than the one they started with?
+- How does this interact with the `TransferWorker()` atomic operation?
+- Should abandoned workers maintain their warm state (loaded dependencies, etc.)?
+
+**Proposal**: TBD - Need to decide based on whether workers can safely reconnect to different Runtimes. If yes, Option A or B provides better efficiency. If no, Option C is simplest.
+
 ---
 
 ## Summary

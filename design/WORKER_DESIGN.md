@@ -10,8 +10,9 @@ This document covers the Worker-side architecture in the new decoupled model, in
 4. [Message Transformation](#message-transformation)
 5. [Specialization Injection](#specialization-injection)
 6. [Sidecar Implementation](#sidecar-implementation)
-7. [Deployment Patterns](#deployment-patterns)
-8. [Open Questions](#open-questions)
+7. [Worker Process Lifecycle Management](#worker-process-lifecycle-management)
+8. [Deployment Patterns](#deployment-patterns)
+9. [Open Questions](#open-questions)
 
 ---
 
@@ -735,6 +736,497 @@ public class SidecarHealthCheck : IHealthCheck
 
 ---
 
+## Worker Process Lifecycle Management
+
+### The Problem: Runtime No Longer Controls Worker Process
+
+In the current model, the Runtime (Script Host) manages the worker process lifecycle:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│  Current Model: Runtime Controls Worker Process                        │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                        │
+│  Runtime detects: languageWorkers:node:arguments changed              │
+│       │                                                                │
+│       ▼                                                                │
+│  Runtime calls: _workerProcess.Kill()                                  │
+│       │                                                                │
+│       ▼                                                                │
+│  Runtime calls: Process.Start("node", newArgs)                         │
+│       │                                                                │
+│       ▼                                                                │
+│  Worker reconnects with new configuration                              │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+In the **new decoupled model**, the Runtime has no control over the worker process:
+- Worker runs in a separate container
+- Runtime cannot `Process.Kill()` or `Process.Start()`
+- Runtime cannot even detect if the worker process has restarted
+
+This creates a problem: **How do we restart the worker process when configuration changes invalidate the placeholder?**
+
+### Settings That Require Worker Process Restart
+
+| Setting | Why Restart Required | Detection Complexity |
+|---------|---------------------|---------------------|
+| `FUNCTIONS_WORKER_RUNTIME_VERSION` | Different runtime binary | App Settings (Easy) |
+| `languageWorkers:<lang>:arguments` | Args passed at process start | App Settings (Easy) |
+| `languageWorkers:<lang>:defaultExecutablePath` | Different binary to execute | App Settings (Easy) |
+| `languageWorkers:<lang>:defaultWorkerPath` | Different entry point | App Settings (Easy) |
+| Bundle-provided overrides | Extension bundles override worker config | App Settings (Medium) |
+| `IWebJobsConfigurationStartup` | .NET extension modifies config at startup | Runtime Load (Hard) |
+
+### Two Detection Scenarios
+
+**Scenario 1: App Settings Overrides (Detectable by Sidecar)**
+
+Most worker configuration overrides come from App Settings, which are exposed as environment variables:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  App Settings Override Detection                                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Environment Variables:                                                 │
+│  ┌───────────────────────────────────────────────────────────────────┐ │
+│  │ FUNCTIONS_WORKER_RUNTIME=python                                    │ │
+│  │ FUNCTIONS_WORKER_RUNTIME_VERSION=3.11                              │ │
+│  │ languageWorkers__python__arguments=--some-arg                     │ │  ← Sidecar can see this
+│  └───────────────────────────────────────────────────────────────────┘ │
+│                                                                         │
+│  Sidecar reads ENV → Detects override → Compares to current process    │
+│                                                                         │
+│  Decision: Restart worker process if mismatch                           │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Scenario 2: IWebJobsConfigurationStartup Overrides (Only Runtime Can Detect)**
+
+For .NET isolated workers and some extensions, configuration can be modified programmatically:
+
+```csharp
+// In customer's code or extension
+public class MyConfigStartup : IWebJobsConfigurationStartup
+{
+    public void Configure(IWebJobsConfigurationBuilder builder)
+    {
+        // This overrides worker arguments at Runtime startup!
+        builder.ConfigurationBuilder.AddInMemoryCollection(new Dictionary<string, string>
+        {
+            ["languageWorkers:dotnet-isolated:arguments"] = "--custom-debug-port=5678"
+        });
+    }
+}
+```
+
+This code only runs **inside the Runtime** when WebJobs extensions load. The Sidecar has no visibility.
+
+### Solution: Wrapper Process + Sidecar Coordination
+
+Introduce a **lightweight wrapper process** in the worker container that manages the actual worker process:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Worker Container Architecture                                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │  Worker Wrapper Process (PID 1)                                   │  │
+│  │  - Lightweight supervisor                                         │  │
+│  │  - Starts/stops actual worker process                             │  │
+│  │  - Listens for restart signals from Sidecar                       │  │
+│  │  - Passes through environment variables                           │  │
+│  └─────────────────────────────┬────────────────────────────────────┘  │
+│                                │                                        │
+│                      Manages   │                                        │
+│                                ▼                                        │
+│  ┌─────────────────┐    ┌──────────────┐    ┌──────────────────────┐  │
+│  │  Worker Process │◄───│    Sidecar   │◄───│  Runtime (Remote)    │  │
+│  │  (python, node) │    │              │    │                      │  │
+│  │                 │    │  - Auth      │    │  - Detects config    │  │
+│  │  Executes       │    │  - Transform │    │    overrides from    │  │
+│  │  functions      │    │  - Restart   │    │    IWebJobsStartup   │  │
+│  └─────────────────┘    │    signal    │    │  - Sends restart cmd │  │
+│                         └──────┬───────┘    └──────────────────────┘  │
+│                                │                                        │
+│                                ▼                                        │
+│                         Restart Signal                                  │
+│                         (API or file)                                   │
+│                                │                                        │
+│                                ▼                                        │
+│                         Worker Wrapper                                  │
+│                         kills & restarts                                │
+│                         worker process                                  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Worker Wrapper Implementation
+
+```go
+// worker-wrapper - A lightweight process supervisor
+// Runs as PID 1 in the container, manages actual worker process
+
+package main
+
+import (
+    "os"
+    "os/exec"
+    "os/signal"
+    "syscall"
+    "net/http"
+    "encoding/json"
+)
+
+type WorkerConfig struct {
+    Executable string   `json:"executable"`
+    Arguments  []string `json:"arguments"`
+    WorkerPath string   `json:"workerPath"`
+}
+
+var (
+    currentProcess *exec.Cmd
+    currentConfig  WorkerConfig
+)
+
+func main() {
+    // Read initial config from environment
+    currentConfig = readConfigFromEnv()
+    
+    // Start the worker process
+    startWorker(currentConfig)
+    
+    // Listen for restart signals
+    go listenForRestartSignal()
+    
+    // Forward OS signals to worker
+    forwardSignals()
+}
+
+func startWorker(config WorkerConfig) {
+    args := append(config.Arguments, config.WorkerPath)
+    currentProcess = exec.Command(config.Executable, args...)
+    currentProcess.Stdout = os.Stdout
+    currentProcess.Stderr = os.Stderr
+    currentProcess.Env = os.Environ()
+    
+    if err := currentProcess.Start(); err != nil {
+        log.Fatalf("Failed to start worker: %v", err)
+    }
+    
+    log.Printf("Started worker process: %s %v (PID: %d)", 
+        config.Executable, args, currentProcess.Process.Pid)
+}
+
+func restartWorker(newConfig WorkerConfig) {
+    log.Printf("Restarting worker with new config: %+v", newConfig)
+    
+    // Graceful shutdown of current process
+    if currentProcess != nil && currentProcess.Process != nil {
+        currentProcess.Process.Signal(syscall.SIGTERM)
+        
+        // Wait with timeout
+        done := make(chan error)
+        go func() { done <- currentProcess.Wait() }()
+        
+        select {
+        case <-done:
+            log.Println("Worker stopped gracefully")
+        case <-time.After(10 * time.Second):
+            log.Println("Worker didn't stop, killing...")
+            currentProcess.Process.Kill()
+        }
+    }
+    
+    // Update config and start new process
+    currentConfig = newConfig
+    startWorker(newConfig)
+}
+
+// HTTP endpoint for Sidecar to trigger restart
+func listenForRestartSignal() {
+    http.HandleFunc("/restart", func(w http.ResponseWriter, r *http.Request) {
+        if r.Method != "POST" {
+            http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+            return
+        }
+        
+        var newConfig WorkerConfig
+        if err := json.NewDecoder(r.Body).Decode(&newConfig); err != nil {
+            http.Error(w, err.Error(), http.StatusBadRequest)
+            return
+        }
+        
+        go restartWorker(newConfig)
+        w.WriteHeader(http.StatusAccepted)
+    })
+    
+    // Listen on Unix socket for security (same pod only)
+    listener, _ := net.Listen("unix", "/var/run/worker-wrapper.sock")
+    http.Serve(listener, nil)
+}
+```
+
+### Sidecar Restart Detection Logic
+
+```csharp
+public class WorkerConfigurationMonitor
+{
+    private readonly WorkerConfig _launchConfig;
+    private readonly ILogger _logger;
+    
+    public WorkerConfigurationMonitor(ILogger logger)
+    {
+        _logger = logger;
+        // Capture the config that was used to launch the worker
+        _launchConfig = ReadCurrentConfig();
+    }
+    
+    /// <summary>
+    /// Called during FunctionEnvironmentReloadRequest processing.
+    /// Detects if environment changes require a worker restart.
+    /// </summary>
+    public async Task<RestartDecision> EvaluateRestartNeeded(
+        IDictionary<string, string> newEnvironment)
+    {
+        var newConfig = ParseWorkerConfig(newEnvironment);
+        
+        // Compare with launch config
+        if (newConfig.RuntimeVersion != _launchConfig.RuntimeVersion)
+        {
+            return RestartDecision.Required(
+                $"Runtime version changed: {_launchConfig.RuntimeVersion} → {newConfig.RuntimeVersion}");
+        }
+        
+        if (!newConfig.Arguments.SequenceEqual(_launchConfig.Arguments))
+        {
+            return RestartDecision.Required(
+                $"Worker arguments changed");
+        }
+        
+        if (newConfig.ExecutablePath != _launchConfig.ExecutablePath)
+        {
+            return RestartDecision.Required(
+                $"Executable path changed: {_launchConfig.ExecutablePath} → {newConfig.ExecutablePath}");
+        }
+        
+        return RestartDecision.NotRequired();
+    }
+    
+    private WorkerConfig ParseWorkerConfig(IDictionary<string, string> env)
+    {
+        var language = env.GetValueOrDefault("FUNCTIONS_WORKER_RUNTIME", "");
+        var version = env.GetValueOrDefault("FUNCTIONS_WORKER_RUNTIME_VERSION", "");
+        
+        // Check for language-specific overrides
+        var argsKey = $"languageWorkers__{language}__arguments";
+        var args = env.GetValueOrDefault(argsKey, "");
+        
+        var exePathKey = $"languageWorkers__{language}__defaultExecutablePath";
+        var exePath = env.GetValueOrDefault(exePathKey, "");
+        
+        return new WorkerConfig
+        {
+            Language = language,
+            RuntimeVersion = version,
+            Arguments = ParseArguments(args),
+            ExecutablePath = exePath
+        };
+    }
+}
+```
+
+### Hybrid Detection Flow
+
+For settings that can only be detected by the Runtime (like `IWebJobsConfigurationStartup`):
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Hybrid Detection: Sidecar + Runtime Coordination                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Phase 1: Sidecar Quick Check (Fast Path)                              │
+│  ──────────────────────────────────────────                             │
+│  1. FunctionEnvironmentReloadRequest arrives                            │
+│  2. Sidecar compares new ENV to launch config                           │
+│  3. If mismatch detected → Restart immediately                          │
+│  4. If no mismatch → Proceed to Phase 2                                 │
+│                                                                         │
+│  Phase 2: Runtime Deep Check (Slow Path - .NET only)                   │
+│  ────────────────────────────────────────────────────                   │
+│  1. Runtime loads IWebJobsConfigurationStartup extensions               │
+│  2. Extensions may modify worker configuration                          │
+│  3. Runtime computes final effective config                             │
+│  4. Runtime compares to reported worker config                          │
+│  5. If mismatch → Runtime sends RestartWorker command to Sidecar       │
+│                                                                         │
+│                                                                         │
+│  Timeline:                                                              │
+│  ─────────────────────────────────────────────────────────────────►    │
+│                                                                         │
+│  [ENV Reload] → [Sidecar Check] → [Runtime Load Extensions]            │
+│                      │                      │                           │
+│                      │ Fast: ~5ms           │ Slow: ~500ms              │
+│                      ▼                      ▼                           │
+│               Restart if needed      Restart if IWebJobsStartup        │
+│                                      modified config                    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Runtime-Initiated Restart Command
+
+When the Runtime detects an `IWebJobsConfigurationStartup` override, it needs to tell the Sidecar to restart the worker:
+
+```protobuf
+// Addition to FunctionRpc.proto
+
+message WorkerRestartRequest {
+    // Reason for restart
+    string reason = 1;
+    
+    // New configuration to apply
+    WorkerConfiguration new_configuration = 2;
+}
+
+message WorkerConfiguration {
+    string executable_path = 1;
+    repeated string arguments = 2;
+    string worker_path = 3;
+    map<string, string> environment_overrides = 4;
+}
+
+message WorkerRestartResponse {
+    enum RestartStatus {
+        ACCEPTED = 0;
+        REJECTED = 1;
+        IN_PROGRESS = 2;
+    }
+    
+    RestartStatus status = 1;
+    string message = 2;
+}
+```
+
+### Sidecar Handling Runtime Restart Command
+
+```csharp
+public class WorkerRestartHandler
+{
+    private readonly IWorkerWrapperClient _wrapperClient;
+    private readonly ILogger _logger;
+    
+    public async Task<WorkerRestartResponse> HandleRestartRequest(
+        WorkerRestartRequest request)
+    {
+        _logger.LogInformation(
+            "Runtime requested worker restart. Reason: {Reason}",
+            request.Reason);
+        
+        // Translate proto config to wrapper config
+        var wrapperConfig = new WrapperRestartConfig
+        {
+            Executable = request.NewConfiguration.ExecutablePath,
+            Arguments = request.NewConfiguration.Arguments.ToList(),
+            WorkerPath = request.NewConfiguration.WorkerPath
+        };
+        
+        // Signal wrapper to restart worker
+        try
+        {
+            await _wrapperClient.RestartWorkerAsync(wrapperConfig);
+            
+            return new WorkerRestartResponse
+            {
+                Status = WorkerRestartResponse.Types.RestartStatus.Accepted,
+                Message = "Worker restart initiated"
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to restart worker");
+            
+            return new WorkerRestartResponse
+            {
+                Status = WorkerRestartResponse.Types.RestartStatus.Rejected,
+                Message = ex.Message
+            };
+        }
+    }
+}
+```
+
+### Communication Options: Sidecar ↔ Worker Wrapper
+
+| Option | Description | Pros | Cons |
+|--------|-------------|------|------|
+| **Unix Socket API** | HTTP/REST over Unix socket | Standard, debuggable, secure | Slightly more overhead |
+| **Shared File Signal** | Wrapper watches file for changes | Very simple, no server needed | Polling overhead, less immediate |
+| **Named Pipe** | Direct IPC | Fast, simple | Platform-specific |
+
+**Recommendation**: Unix Socket API (as shown above) - provides a clean interface, good security (pod-local only), and easy debugging.
+
+### Restart Flow Summary
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Complete Restart Detection & Execution Flow                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌────────────┐    ┌────────────┐    ┌────────────┐    ┌────────────┐ │
+│  │   Scale    │    │  Runtime   │    │  Sidecar   │    │  Wrapper   │ │
+│  │ Controller │    │            │    │            │    │            │ │
+│  └─────┬──────┘    └─────┬──────┘    └─────┬──────┘    └─────┬──────┘ │
+│        │                 │                 │                 │        │
+│        │  Specialize     │                 │                 │        │
+│        │─────────────────>                 │                 │        │
+│        │                 │                 │                 │        │
+│        │                 │ FunctionEnvReload                 │        │
+│        │                 │─────────────────>                 │        │
+│        │                 │                 │                 │        │
+│        │                 │                 │ ┌─────────────┐ │        │
+│        │                 │                 │ │Check ENV vs │ │        │
+│        │                 │                 │ │launch config│ │        │
+│        │                 │                 │ └──────┬──────┘ │        │
+│        │                 │                 │        │        │        │
+│        │                 │           ┌─────┴────────┴─────┐  │        │
+│        │                 │           │  Mismatch?         │  │        │
+│        │                 │           └─────┬────────┬─────┘  │        │
+│        │                 │                 │ Yes    │ No     │        │
+│        │                 │                 ▼        │        │        │
+│        │                 │           POST /restart  │        │        │
+│        │                 │                 │───────────────> │        │
+│        │                 │                 │        │        │        │
+│        │                 │                 │        ▼        │        │
+│        │                 │ Load Extensions │  Continue       │        │
+│        │                 │ ┌─────────────┐ │  normally       │        │
+│        │                 │ │IWebJobsStart│ │                 │        │
+│        │                 │ │up override? │ │                 │        │
+│        │                 │ └──────┬──────┘ │                 │        │
+│        │                 │        │ Yes    │                 │        │
+│        │                 │        ▼        │                 │        │
+│        │                 │ WorkerRestartReq│                 │        │
+│        │                 │─────────────────>                 │        │
+│        │                 │                 │ POST /restart   │        │
+│        │                 │                 │───────────────> │        │
+│        │                 │                 │                 │        │
+│        │                 │                 │                 │ Kill   │
+│        │                 │                 │                 │ old    │
+│        │                 │                 │                 │ Start  │
+│        │                 │                 │                 │ new    │
+│        │                 │                 │                 │        │
+│        │                 │                 │◄─ Worker reconnects ────│
+│        │                 │                 │                 │        │
+│                                                                        │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## Deployment Patterns
 
 ### Pattern 1: Sidecar Container (Kubernetes)
@@ -916,6 +1408,39 @@ This provides visibility into the proxy layer without requiring worker changes.
 - C) Shared sidecar service (pool)
 
 **Proposal**: Option A for isolation and simplicity. Resource overhead of sidecar is minimal (stateless gRPC proxy).
+
+### 9. Worker Wrapper vs Container Restart
+
+**Question**: Should the wrapper restart the worker process, or should the entire container be restarted?
+
+**Options**:
+- A) Wrapper restarts worker process in-place (faster, preserves connections)
+- B) Container restarts entirely (simpler, cleaner state)
+- C) Hybrid: wrapper for config changes, container for failures
+
+**Considerations**:
+- In-place restart is faster (~seconds vs ~30s for container)
+- Container restart guarantees clean state
+- Some orchestrators (ACA, AKS) have good container restart primitives
+- Wrapper adds complexity but provides fine-grained control
+
+**Proposal**: Option C - Use wrapper for known config changes (fast path), container restart for crashes/unknown states. The wrapper should detect if it cannot restart cleanly and signal the orchestrator to restart the container.
+
+### 10. IWebJobsConfigurationStartup Detection Timing
+
+**Question**: When should the Runtime check for `IWebJobsConfigurationStartup` overrides?
+
+**Options**:
+- A) During initial JobHost creation (before first function load)
+- B) Only during specialization (FunctionEnvironmentReload)
+- C) Both A and B
+
+**Considerations**:
+- Placeholder JobHosts don't load customer extensions
+- Customer JobHosts load extensions during creation
+- Extensions could theoretically change config at any time
+
+**Proposal**: Option B - Only check during specialization. The Placeholder JobHost uses default config. When specializing, the Customer JobHost is created and extensions load, at which point we can detect mismatches.
 
 ---
 
