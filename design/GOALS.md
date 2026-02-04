@@ -1354,6 +1354,70 @@ func v2-compat check --resource-group myRg --name myFunctionApp
 4. **Forced migration**: Should we ever force-migrate apps, or always require explicit opt-in?
 5. **Feature flags**: Should we allow v2 features on v1 SKUs via feature flags for testing?
 
+### Alternative Rollout: Language Version Gating
+
+An alternative to versioned SKUs is to tie the new model to **new language runtime versions**. This leverages existing customer behavior around language upgrades.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Language Version Gating Strategy                                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Current versions (v1 model):       New versions (v2 model):            │
+│  ─────────────────────────────      ────────────────────────            │
+│  • Python 3.10, 3.11                • Python 3.13+                      │
+│  • Node.js 18, 20                   • Node.js 22+                       │
+│  • Java 11, 17                      • Java 21+                          │
+│  • .NET 8 isolated                  • .NET 10+ isolated                 │
+│  • PowerShell 7.2, 7.4              • PowerShell 7.6+                   │
+│                                                                         │
+│  Existing versions → v1 forever (until language EOL)                    │
+│  New versions → v2 only                                                 │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**How it works:**
+- When a new major language version is released (e.g., Python 3.13), it launches on v2 model only
+- Existing language versions (e.g., Python 3.11) stay on v1 model indefinitely
+- Customers naturally migrate when they upgrade their language version
+- Old versions deprecate according to standard language EOL timelines
+
+**Benefits:**
+
+| Benefit | Description |
+|---------|-------------|
+| **Natural migration trigger** | Customers already expect changes when upgrading language versions |
+| **No forced migration** | v1 stays stable; customers migrate on their own timeline |
+| **Expected breaking changes** | Major version upgrades often have breaking changes anyway |
+| **Slower but safer** | Multi-year rollout aligned with language lifecycles |
+| **Clear documentation** | "Python 3.13 requires the new worker model" |
+
+**Drawbacks:**
+
+| Drawback | Description |
+|----------|-------------|
+| **Slower adoption** | Could take 3-5 years to reach majority of customers |
+| **Dual maintenance** | Must maintain v1 and v2 infrastructure longer |
+| **Fragmented experience** | Same app could behave differently based on language version |
+| **Testing complexity** | Language + model version matrix |
+
+**Rollout Timeline (Example):**
+
+```
+2026 Q3: Python 3.13 launches on v2 model
+2026 Q4: Node.js 22 launches on v2 model
+2027 Q1: Java 21 support moves to v2 model
+2027 Q2: .NET 10 isolated launches on v2 model
+...
+2028: Python 3.11 reaches EOL → all Python users now on v2
+2029: Node.js 20 reaches EOL → all Node users now on v2
+```
+
+This approach may be combined with versioned SKUs - offering both paths:
+- **Fast path**: Switch to v2 SKU today (for customers who want benefits now)
+- **Slow path**: Stay on current language version until you're ready to upgrade
+
 ---
 
 ## Conclusion
