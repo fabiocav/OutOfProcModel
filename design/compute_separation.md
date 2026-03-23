@@ -22,9 +22,11 @@ The existing host-managed worker model is **completely untouched**. All new code
 | Function metadata | 100% worker indexing — no `function.json` reads | Workers report their own functions; host just validates |
 | Invocation dispatcher | New `ConnectedWorkerInvocationDispatcher` — not `RpcFunctionInvocationDispatcher` | Avoids inheriting process-restart logic that is meaningless for external workers |
 | Code split | Extract `WorkerChannelBase` (protocol-only); both old and new channels inherit it | Clean separation; old code becomes deletable when proven |
-| Auth / networking | Network-level trust for preview | Sufficient for controlled preview environment |
+| Auth / networking | Auth on outbound gRPC connection deferred to later milestone | Design accommodates future auth; not required for preview |
+| Connection direction | Runtime is gRPC **client** connecting outbound; worker behavior unchanged | Networking restrictions prevent inbound connections to the runtime |
+| gRPC relay | .NET AOT-compiled relay process co-located with the worker pod (see Sidecar Architecture) | Preserves existing worker gRPC protocol; runtime is agnostic to relay topology |
 | Reconnection | Stateless (new `workerId` on reconnect) | No sticky sessions for preview |
-| host.json delivery | Worker sends host.json content via gRPC `StartStream`; host blocks in `ConfigureAppConfiguration` until received | Host has no access to customer payload in separated compute; gRPC server is already listening (WebHost-level) before ScriptHost is built |
+| host.json delivery | Worker sends host.json content via gRPC `StartStream`; runtime blocks in `ConfigureAppConfiguration` until received | Host has no access to customer payload in separated compute |
 
 ---
 
@@ -33,10 +35,9 @@ The existing host-managed worker model is **completely untouched**. All new code
 See [`compute_separation_p2.md`](./compute_separation_p2.md) for detailed designs of lower-priority items.
 
 - Scale controller integration
-- Sidecar / wrapper process
 - `WorkerConnect` consolidated protocol message (the prototype uses a new message type 50; we use the existing init sequence for preview)
 - ApplicationId-based routing
-- gRPC auth
+- Outbound gRPC authentication (design accommodates it; implementation deferred)
 - SquashFS mounting / package download
 - Extension assembly loading for non-bundle / dotnet-isolated apps (host-initiated streaming from worker)
 
@@ -46,14 +47,11 @@ See [`compute_separation_p2.md`](./compute_separation_p2.md) for detailed design
 
 | Milestone | Description | Target |
 |---|---|---|
-| M1 | Extract `WorkerChannelBase` from `GrpcWorkerChannel` | Late March |
-| M2 | `ConnectedWorkerChannel` + new manager + dispatcher | Early April |
-| M2b | `ConnectedWorkerFunctionMetadataProvider` — metadata without process spawn | Early April |
-| M3 | Inbound connection acceptance in `FunctionRpcService` + `WorkerConnectionService` | Mid April |
-| M3b | host.json delivery via gRPC — `HostJsonContentProvider` + `ExternalWorkerHostJsonConfigurationSource` | Mid April |
-| M4 | Configuration, DI wiring, trigger readiness gate | Late April |
-| M4b | Placeholder mode support — warmup without a worker, specialization flow | Late April |
-| M5 | Hardening, observability, integration tests | May |
+| M1 | Extract `WorkerChannelBase` from `GrpcWorkerChannel` | ✅ Late March |
+| M2 | `ConnectedWorkerChannel` + new manager + dispatcher | 🔄 Early April |
+| M3 | E2E vertical slice: sidecar stub, outbound gRPC client, metadata provider, host.json via capabilities, Aspire harness | Mid April |
+| M4 | Production APIs (`/admin/workers/assign`, `/admin/instance/specialize`), placeholder mode | Late April |
+| M5 | Hardening: disconnection handling, scale-out, logging, health checks, integration tests | May |
 | Buffer | Preview prep, docs, feedback | June |
 
 ---
@@ -70,26 +68,36 @@ src/WebJobs.Script.Grpc/
     IConnectedWorkerChannelManager.cs                 (M2)
     ConnectedWorkerChannelManager.cs                  (M2)
     ConnectedWorkerInvocationDispatcher.cs            (M2)
-    ConnectedWorkerFunctionMetadataProvider.cs        (M2b)
-    HostJsonContentProvider.cs                        (M3b)
-    ExternalWorkerHostJsonConfigurationSource.cs      (M3b)
+    OutboundGrpcClient.cs                             (M3)
     WorkerConnectionService.cs                        (M3)
     WorkerConnectedEvent.cs                           (M3)
-    ExternalWorkerOptions.cs                          (M4)
-    ExternalWorkerServiceCollectionExtensions.cs      (M4)
+    ConnectedWorkerFunctionMetadataProvider.cs        (M3)
+    HostJsonContentProvider.cs                        (M3)
+    ExternalWorkerHostJsonConfigurationSource.cs      (M3)
+    ExternalWorkerOptions.cs                          (M3)
+    ExternalWorkerServiceCollectionExtensions.cs      (M3)
+    ExternalWorkerController.cs                       (M4)
+    WorkerAssignmentRequest.cs                        (M4)
 
-azure-functions-language-worker-protobuf/
-  src/proto/FunctionRpc.proto                         (M3b — add host_configuration_json to StartStream)
+tools/compute-separation-harness/
+  AppHost/
+    Program.cs                                        (M3 — Aspire orchestrator)
+    AppHost.csproj
+  Sidecar/
+    Program.cs                                        (M3 — gRPC relay + HTTP proxy)
+    Sidecar.csproj
+  README.md                                           (M3)
 ```
 
 ## Modified Files
 
 ```
 src/WebJobs.Script.Grpc/Channel/GrpcWorkerChannel.cs           (M1 — slim to lifecycle-only)
-src/WebJobs.Script.Grpc/Server/FunctionRpcService.cs           (M3 — add inbound branch; M3b — intercept host.json)
-src/WebJobs.Script/ScriptHostBuilderExtensions.cs              (M3b — conditional config source swap)
-src/WebJobs.Script.Grpc/Rpc/RpcInitializationService.cs       (M4b — skip placeholder worker spawn in external mode)
+src/WebJobs.Script/ScriptHostBuilderExtensions.cs              (M3 — conditional config source swap)
+src/WebJobs.Script.Grpc/Rpc/RpcInitializationService.cs       (M4 — skip placeholder worker spawn in external mode)
 ```
+
+**No proto changes required.** host.json is delivered via worker capabilities (`host_configuration_json` key). Function metadata via existing `GetFunctionMetadata()` RPC.
 
 ---
 
@@ -599,724 +607,436 @@ namespace Microsoft.Azure.WebJobs.Script.Grpc.ExternalWorkers
 
 ---
 
-## M2b: `ConnectedWorkerFunctionMetadataProvider`
+## Sidecar Architecture
 
-### Problem: process spawn during metadata retrieval
+> **Note**: This section describes the **deployment infrastructure** that sits between the runtime and the worker. The runtime itself is agnostic to the sidecar — it only knows it is connecting outbound to a gRPC endpoint. See M3 for the runtime-side design.
 
-The existing metadata path starts a worker process **before** the dispatcher is even initialized:
+### Pod topology
 
-```
-ScriptHost.InitializeAsync()
-  → GetFunctionsMetadata()
-    → FunctionMetadataManager.GetFunctionMetadata()
-      → FunctionMetadataProvider.GetFunctionMetadataAsync()
-        → [CanWorkerIndex() == true]
-          → WorkerFunctionMetadataProvider.GetFunctionMetadataAsync()
-            → _channelManager.GetChannels() — no channels yet!
-              → _channelManager.InitializeChannelAsync()     ← STARTS PROCESS
-```
-
-`WorkerFunctionMetadataProvider` depends on `IWebHostRpcWorkerChannelManager`. When no channels exist, it calls `InitializeChannelAsync()` which creates a `GrpcWorkerChannel` and spawns the worker process. This happens at line ~91 of `WorkerFunctionMetadataProvider.cs`, well before `RpcFunctionInvocationDispatcher.InitializeAsync()` runs.
-
-For external workers we cannot spawn — we must **wait** for an inbound connection.
-
-### Solution: new `IWorkerFunctionMetadataProvider` implementation
+There are two pod types running on separate compute in a **1:M** relationship:
 
 ```
-                     IWorkerFunctionMetadataProvider
-                        /                    \
-    WorkerFunctionMetadataProvider    ConnectedWorkerFunctionMetadataProvider
-    (existing — starts processes)     (new — waits for inbound connection)
-           |                                    |
-    IWebHostRpcWorkerChannelManager      IConnectedWorkerChannelManager
+┌──────────────────────┐          ┌──────────────────────────────────────┐
+│     Runtime Pod      │          │           Worker Pod (×M)            │
+│                      │          │                                      │
+│  ┌────────────────┐  │   gRPC   │  ┌──────────┐      ┌─────────────┐  │
+│  │    Runtime     │──│─────────>│──│  Sidecar  │<─────│   Worker    │  │
+│  │  (gRPC client) │  │          │  │(gRPC svr) │      │  (customer  │  │
+│  │                │──│── HTTP ─>│──│(HTTP proxy)│─────>│    code)    │  │
+│  └────────────────┘  │          │  └──────────┘      └─────────────┘  │
+│                      │          │                                      │
+└──────────────────────┘          └──────────────────────────────────────┘
 ```
 
-The orchestrator (`FunctionMetadataProvider`) and the host-indexing fallback are untouched. Only the `IWorkerFunctionMetadataProvider` implementation is swapped via DI when external workers are enabled.
+- **Runtime pod**: runs the Functions host. Connects outbound to each worker pod.
+- **Worker pod**: contains the sidecar + the worker process (customer code). The sidecar is the entry point that the runtime connects to.
+- **1:M**: one runtime pod serves multiple worker pods (scale-out). Each `/admin/workers/assign` call adds a new worker pod connection.
 
-### New file: `ExternalWorkers/ConnectedWorkerFunctionMetadataProvider.cs`
+### Why a sidecar?
+
+Networking restrictions prevent the runtime from acting as a gRPC server that external workers connect to. The runtime must initiate **outbound** connections. However, existing workers expect to connect to a gRPC server implementing `FunctionRpc.EventStream`. The sidecar resolves this by acting as a relay within the worker pod:
+
+The runtime sees only a gRPC endpoint. It does not know or care whether the other end is a sidecar, a direct worker, or any other relay topology.
+
+### Sidecar responsibilities
+
+1. **Worker-facing gRPC server** — implements `FunctionRpc.EventStream` (same proto). Worker connects exactly as it does today. Zero changes to worker behavior.
+2. **Runtime-facing gRPC server** — implements `FunctionRpc.EventStream` on a separate port. Runtime connects as a gRPC client and sends host messages / receives worker messages.
+3. **Message relay** — forwards `StreamingMessage`s between the two streams. Messages are forwarded as-is for preview; future milestones may add transformation (e.g., injecting auth tokens, filtering).
+4. **HTTP proxy** — forwards HTTP requests from runtime to worker (for HTTP trigger forwarding). Required because of authentication requirements on the runtime→worker boundary.
+5. **Future: authentication** — the sidecar is the trust boundary. Design accommodates this; implementation is deferred.
+
+### Sidecar implementation
+
+The sidecar is a standalone .NET AOT-compiled application deployed alongside the worker process in the same pod. It is intentionally minimal:
 
 ```csharp
-namespace Microsoft.Azure.WebJobs.Script.Grpc.ExternalWorkers
+// Program.cs — AOT entrypoint
+var builder = WebApplication.CreateSlimBuilder(args);
+builder.WebHost.ConfigureKestrel(k =>
 {
-    /// <summary>
-    /// Metadata provider for external (separately-hosted) workers.
-    /// Instead of starting a worker process to retrieve metadata, waits for an
-    /// external worker to connect inbound and complete the init handshake, then
-    /// calls GetFunctionMetadata() over the existing gRPC channel.
-    ///
-    /// Registered as IWorkerFunctionMetadataProvider when external workers are enabled.
-    /// </summary>
-    internal class ConnectedWorkerFunctionMetadataProvider : IWorkerFunctionMetadataProvider
+    k.ListenAnyIP(runtimePort, o => o.Protocols = HttpProtocols.Http2);  // runtime-facing
+    k.ListenAnyIP(workerPort, o => o.Protocols = HttpProtocols.Http2);   // worker-facing
+    k.ListenAnyIP(httpProxyPort);                                         // HTTP proxy
+});
+builder.Services.AddGrpc();
+builder.Services.AddSingleton<FunctionRpcRelay>();
+var app = builder.Build();
+app.MapGrpcService<FunctionRpcRelay>();
+app.MapForwarder("/{**path}", workerHttpEndpoint);  // YARP-based HTTP proxy
+app.Run();
+```
+
+```csharp
+// FunctionRpcRelay.cs — bidirectional gRPC relay
+// Implements FunctionRpc.EventStream on BOTH ports.
+// When a runtime connects, it creates a pending session.
+// When a worker connects, it pairs with the pending session.
+// Messages from one stream are forwarded to the other.
+//
+// The relay does NOT interpret messages. It forwards StreamingMessage
+// payloads verbatim. This keeps it simple and version-independent.
+```
+
+### Why the same `FunctionRpc.EventStream` proto on both sides?
+
+`StreamingMessage` is a `oneof` containing all message types (host→worker and worker→host). Either side can send any message type. By reusing the same RPC:
+
+- **No new proto changes** needed for the relay
+- Runtime's `OutboundGrpcClient` is a standard gRPC client calling `EventStream`
+- The relay is transparent — it doesn't need to understand message semantics
+- Future proto additions (new message types) work automatically
+
+### Connection lifecycle
+
+```
+1. Sidecar starts → listening on runtime-port and worker-port
+2. Worker starts → connects to sidecar:worker-port → calls EventStream
+3. Sidecar holds worker stream, waiting for runtime
+4. Runtime starts → connects to configured gRPC endpoint → calls EventStream
+5. Sidecar pairs the two streams → begins bidirectional relay
+6. Worker sends StartStream → relayed to runtime → triggers channel creation
+7. Normal init handshake proceeds (WorkerInitRequest/Response) through relay
+8. Invocations flow through relay transparently
+```
+
+---
+
+## M3: E2E Vertical Slice
+
+M3 consolidates what was previously M2b, M3, M3b, and parts of M4 into a single deliverable that produces a working E2E demo. No proto changes. No placeholder support. No production APIs. Just a `curl` that executes a function through the sidecar.
+
+### What M3 delivers
+
+```
+$ curl http://localhost:7071/api/HttpTrigger?name=World
+Hello World
+```
+
+With this topology running locally via Aspire:
+
+```
+Runtime Pod                         Worker Pod
++----------------+   gRPC    +------------+    +-------------+
+|    Runtime     |---------->|  Sidecar   |<---|   Worker    |
+|  (gRPC client) |   HTTP    |(gRPC relay)|    |  (Node.js)  |
+|                |---------->|(HTTP proxy)|-->|             |
++----------------+           +------------+    +-------------+
+```
+
+### Startup flow (non-placeholder, config-driven)
+
+```
+WebHost starts hosted services (sequential, by registration order):
+  1. RpcInitializationService.StartAsync()
+       -> gRPC server up (for host-managed workers -- unchanged)
+
+  2. WorkerConnectionService.StartAsync()
+       -> reads FUNCTIONS_WORKER_EXTERNAL_GRPC_ENDPOINT
+       -> OutboundGrpcClient.ConnectAsync()
+       -> ConnectedWorkerChannel created, BeginInboundProcessing()
+       -> Worker sends StartStream -> SendWorkerInitRequest()
+       -> Worker sends WorkerInitResponse (with capabilities)
+       -> Extract capabilities["host_configuration_json"]
+         -> HostJsonContentProvider.SetContent()
+       -> WorkerConnectedEvent -> channel registered in manager
+       [blocks until handshake completes -- ensures host.json available]
+
+  3. WebJobsScriptHostService.StartAsync()
+       -> builds ScriptHost
+       -> ConfigureAppConfiguration
+            ExternalWorkerHostJsonConfigurationProvider.Load()
+            -> content already available from step 2 -- no blocking
+       -> ConfigureServices (with real host.json values)
+       -> InitializeAsync
+            ConnectedWorkerFunctionMetadataProvider.GetFunctionMetadataAsync()
+            -> WaitForChannelAsync() returns immediately (channel ready from step 2)
+            -> channel.GetFunctionMetadata() -- worker reports its functions
+       -> Functions loaded, triggers started
+
+  Host ready, serving traffic
+```
+
+### M3 sub-tasks
+
+#### (a) Sidecar stub
+
+Minimal .NET AOT project under `tools/compute-separation-harness/Sidecar/`. Three ports:
+
+| Port | Protocol | Purpose |
+|---|---|---|
+| runtime-grpc | gRPC (HTTP/2) | Runtime-facing `EventStream` relay |
+| worker-grpc | gRPC (HTTP/2) | Worker-facing `EventStream` relay |
+| http-proxy | HTTP/1.1 | HTTP reverse proxy (runtime -> worker) |
+
+The sidecar reads `host.json` from the worker pod filesystem and injects it into `WorkerInitResponse.capabilities` with the well-known key `host_configuration_json` before relaying to the runtime.
+
+#### (b) OutboundGrpcClient
+
+The mirror of `FunctionRpcService`: initiates an outbound gRPC stream to a remote endpoint. Bridges to `Channel<InboundGrpcEvent>` / `Channel<OutboundGrpcEvent>`. The runtime is agnostic to what is on the other end -- sidecar, direct worker, or any other topology.
+
+#### (c) WorkerConnectionService
+
+Manages outbound connections. In M3, connects on startup from `FUNCTIONS_WORKER_EXTERNAL_GRPC_ENDPOINT`. In M4, becomes API-driven via `/admin/workers/assign`.
+
+Blocks in `StartAsync()` until `WorkerInitResponse` completes. Extracts `host_configuration_json` from capabilities and calls `HostJsonContentProvider.SetContent()`. This guarantees host.json is available before `WebJobsScriptHostService` builds the ScriptHost.
+
+#### (d) host.json via capabilities
+
+**No proto change.** The sidecar injects `host_configuration_json` into `WorkerInitResponse.capabilities`. `WorkerConnectionService` extracts it and feeds `HostJsonContentProvider`. `ExternalWorkerHostJsonConfigurationProvider.Load()` reads from the provider (content already available -- no blocking in the non-placeholder flow).
+
+#### (e) ConnectedWorkerFunctionMetadataProvider
+
+Replaces `WorkerFunctionMetadataProvider` via DI. Waits for a connected channel, then calls `channel.GetFunctionMetadata()`. No process spawn. No `function.json` on disk.
+
+#### (f) ExternalWorkerOptions + DI wiring
+
+```
+FUNCTIONS_WORKER_EXTERNAL_ENABLED=true
+FUNCTIONS_WORKER_EXTERNAL_GRPC_ENDPOINT=http://localhost:50051
+```
+
+`AddExternalWorkerSupport()` registers all external worker services and replaces `IFunctionInvocationDispatcher` and `IWorkerFunctionMetadataProvider`.
+
+#### (g) Aspire harness
+
+Orchestrates runtime + sidecar + worker with distributed tracing, structured logging, and automatic port wiring.
+
+#### (h) ConnectedWorkerChannel publishes WorkerConnectedEvent
+
+Override `WorkerInitResponse` to publish `WorkerConnectedEvent` after base call. This signals the handshake is complete and triggers channel registration.
+
+### `FunctionRpcService.cs` -- UNMODIFIED
+
+External workers connect via `OutboundGrpcClient`. `FunctionRpcService` serves only host-managed workers.
+
+
+
+---
+
+## M4: Production APIs + Placeholder Mode
+
+Configuration, DI wiring, and `ExternalWorkerOptions` are delivered in M3. M4 adds the production API surface and placeholder mode support needed for the Azure deployment model.
+
+---
+
+## M4 APIs: Specialization + Worker Assignment
+
+### Problem
+
+In the existing model, `/admin/instance/assign` delivers app context and the host specializes and starts workers itself. In the separated compute model, three things happen that are decoupled from each other:
+
+1. **App assignment** — infrastructure tells the runtime about the app (settings, name, etc.)
+2. **Worker provisioning** — infrastructure starts worker pod(s) on separate compute
+3. **Worker connection** — infrastructure tells the runtime where the worker(s) are (endpoint info)
+
+Steps 1 and 2 happen concurrently. Step 3 happens once worker pods have IP addresses. The runtime must handle a **two-phase** flow: specialize with app context, then unblock when workers are assigned.
+
+### Design: two separate API calls
+
+#### API 1: `POST /admin/instance/specialize`
+
+Delivers the app context (similar to today's `/admin/instance/assign`). The runtime begins specialization but **does not wait for a worker** — it pauses at the point where it needs worker interaction (metadata retrieval, host.json delivery).
+
+**Request body:**
+
+```json
+{
+  "assignmentContext": {
+    "siteName": "my-function-app",
+    "siteId": 12345,
+    "environment": {
+      "FUNCTIONS_WORKER_RUNTIME": "node",
+      "AzureWebJobsStorage": "...",
+      "CUSTOM_SETTING": "value"
+    },
+    "secrets": { ... },
+    "corsSettings": { ... }
+  }
+}
+```
+
+This is intentionally close to the existing `HostAssignmentContext` to reuse the specialization machinery. The key difference: **no worker is started**. The host applies settings, reloads config, and restarts — but blocks in `ConnectedWorkerFunctionMetadataProvider.WaitForChannelAsync()` and `ExternalWorkerHostJsonConfigurationProvider.Load()` waiting for worker connections.
+
+**Response:** `202 Accepted` (specialization in progress) or `409 Conflict` (already specialized).
+
+**Implementation:** Can share code with `InstanceController.Assign()` and `StandbyManager.SpecializeHostCoreAsync()`. The only difference is that `_workerManager.SpecializeAsync()` is a no-op (no placeholder workers to specialize), and the host blocks during ScriptHost build waiting for workers.
+
+#### API 2: `POST /admin/workers/assign`
+
+Called by infrastructure when a worker pod is ready. Provides the gRPC endpoint to connect to. Can be called **multiple times** — once per worker pod assigned to this runtime.
+
+**Request body:**
+
+```json
+{
+  "workerId": "w_a1b2c3d4",
+  "grpcEndpoint": "http://10.0.1.42:50051"
+}
+```
+
+**Behavior:**
+1. `WorkerConnectionService` creates an `OutboundGrpcClient` for this endpoint
+2. Registers gRPC channels via `_eventManager.AddGrpcChannels(workerId)`
+3. Creates `ConnectedWorkerChannel`, calls `StartWorkerProcessAsync()`
+4. Worker's `StartStream` arrives → host.json delivered → `HostJsonContentProvider.SetContent()` **unblocks** the config pipeline (on first worker)
+5. `WorkerInitRequest` / `WorkerInitResponse` handshake completes
+6. `WorkerConnectedEvent` → channel registered in `ConnectedWorkerChannelManager`
+7. `WaitForChannelAsync()` **unblocks** → metadata retrieved → functions loaded → triggers start
+
+For **subsequent** worker assignments (scaling out):
+- Steps 1-6 repeat — a new `OutboundGrpcClient` and `ConnectedWorkerChannel` are created
+- No host restart needed — `ConnectedWorkerChannelManager.AddChannel()` adds to the pool
+- `ConnectedWorkerInvocationDispatcher` picks up the new channel via round-robin
+- `SetupChannel()` loads existing functions onto the new worker
+
+**Response:** `202 Accepted` (connection in progress) or `400 Bad Request` (validation failure).
+
+### Endpoint controller
+
+```csharp
+// New: ExternalWorkerController.cs (or add to existing InstanceController)
+[Authorize(Policy = PolicyNames.AdminAuthLevel)]
+[ApiController]
+public class ExternalWorkerController : ControllerBase
+{
+    private readonly IWorkerConnectionService _connectionService;
+
+    [HttpPost("admin/workers/assign")]
+    public async Task<IActionResult> AssignWorker([FromBody] WorkerAssignmentRequest request)
     {
-        private static readonly TimeSpan DefaultTimeout = TimeSpan.FromMinutes(2);
-
-        private readonly IConnectedWorkerChannelManager _channelManager;
-        private readonly IOptionsMonitor<ScriptApplicationHostOptions> _scriptOptions;
-        private readonly ILogger<ConnectedWorkerFunctionMetadataProvider> _logger;
-        private readonly IEnvironment _environment;
-
-        private ImmutableArray<FunctionMetadata> _functions;
-
-        public ImmutableDictionary<string, ImmutableArray<string>> FunctionErrors { get; private set; }
-            = ImmutableDictionary<string, ImmutableArray<string>>.Empty;
-
-        public ConnectedWorkerFunctionMetadataProvider(
-            IConnectedWorkerChannelManager channelManager,
-            IOptionsMonitor<ScriptApplicationHostOptions> scriptOptions,
-            ILogger<ConnectedWorkerFunctionMetadataProvider> logger,
-            IEnvironment environment)
+        if (request is null || string.IsNullOrEmpty(request.GrpcEndpoint))
         {
-            _channelManager = channelManager;
-            _scriptOptions = scriptOptions;
-            _logger = logger;
-            _environment = environment;
+            return BadRequest("grpcEndpoint is required.");
         }
 
-        public async Task<FunctionMetadataResult> GetFunctionMetadataAsync(
-            IEnumerable<RpcWorkerConfig> workerConfigs, bool forceRefresh = false)
-        {
-            if (!_functions.IsDefaultOrEmpty && !forceRefresh)
-            {
-                return new FunctionMetadataResult(useDefaultMetadataIndexing: false, _functions);
-            }
+        string workerId = request.WorkerId ?? $"w_{Guid.NewGuid().ToString("N")[..8]}";
+        var endpoint = new Uri(request.GrpcEndpoint);
 
-            _logger.LogInformation("Waiting for external worker to connect for metadata indexing.");
+        await _connectionService.ConnectWorkerAsync(workerId, endpoint);
 
-            // Block until an external worker connects and completes init.
-            // This replaces the InitializeChannelAsync() call in WorkerFunctionMetadataProvider
-            // that would normally spawn a process.
-            IRpcWorkerChannel channel = await _channelManager.WaitForChannelAsync(DefaultTimeout);
-
-            _logger.LogInformation(
-                "External worker {workerId} connected. Requesting function metadata.",
-                channel.Id);
-
-            // Standard metadata retrieval — identical to WorkerFunctionMetadataProvider
-            var rawFunctions = await channel.GetFunctionMetadata();
-
-            if (rawFunctions.Any(x => x.UseDefaultMetadataIndexing))
-            {
-                _logger.LogDebug("External worker opted out of indexing; falling back to host.");
-                _functions = ImmutableArray<FunctionMetadata>.Empty;
-                return new FunctionMetadataResult(useDefaultMetadataIndexing: true, _functions);
-            }
-
-            // Validate metadata (same logic as WorkerFunctionMetadataProvider.ValidateMetadata)
-            var validated = ValidateMetadata(rawFunctions);
-            _functions = validated.ToImmutableArray();
-
-            return new FunctionMetadataResult(useDefaultMetadataIndexing: false, _functions);
-        }
-
-        private IEnumerable<FunctionMetadata> ValidateMetadata(IEnumerable<RawFunctionMetadata> rawFunctions)
-        {
-            // Same validation as WorkerFunctionMetadataProvider:
-            // - validate function names, bindings, retry options
-            // - populate FunctionErrors for invalid entries
-            // Implementation mirrors WorkerFunctionMetadataProvider.ValidateMetadata()
-            // (consider extracting shared validation into a static helper)
-        }
+        return Accepted(new { workerId });
     }
 }
 ```
 
-### Startup sequence with this provider
+```csharp
+public class WorkerAssignmentRequest
+{
+    /// <summary>Orchestrator-assigned worker ID. Generated if null.</summary>
+    [JsonProperty("workerId")]
+    public string WorkerId { get; set; }
+
+    /// <summary>gRPC endpoint to connect to (e.g., "http://10.0.1.42:50051").</summary>
+    [JsonProperty("grpcEndpoint")]
+    public string GrpcEndpoint { get; set; }
+}
+```
+
+### WorkerConnectionService changes
+
+`WorkerConnectionService` evolves from a simple `IHostedService` that connects on startup to a service that manages **multiple** outbound connections on demand:
+
+```csharp
+internal class WorkerConnectionService : IHostedService, IWorkerConnectionService
+{
+    private readonly ConcurrentDictionary<string, OutboundGrpcClient> _clients = new();
+
+    // Called by ExternalWorkerController
+    public async Task ConnectWorkerAsync(string workerId, Uri endpoint, string language)
+    {
+        _logger.LogInformation("Connecting to worker {workerId} at {endpoint}", workerId, endpoint);
+
+        // 1. Register gRPC channels
+        _eventManager.AddGrpcChannels(workerId);
+
+        // 2. Create and connect outbound gRPC client
+        var client = new OutboundGrpcClient(_eventManager, _loggerFactory.CreateLogger<OutboundGrpcClient>());
+        await client.ConnectAsync(workerId, endpoint, CancellationToken.None);
+        _clients[workerId] = client;
+
+        // 3. Create ConnectedWorkerChannel
+        var workerConfig = BuildWorkerConfig(language);
+        var channel = _channelFactory.Create(workerId, workerConfig);
+
+        // 4. Start inbound processing — waits for StartStream
+        await channel.StartWorkerProcessAsync(CancellationToken.None);
+    }
+
+    // StartAsync no longer initiates connections — waits for API calls
+    public Task StartAsync(CancellationToken cancellationToken)
+    {
+        _workerConnectedSubscription = _eventManager
+            .OfType<WorkerConnectedEvent>()
+            .Subscribe(OnWorkerConnected);
+        return Task.CompletedTask;
+    }
+
+    // ... OnWorkerConnected, StopAsync, DisposeAsync unchanged
+}
+```
+
+### Full flow timeline
 
 ```
-1. Host starts → FunctionRpcService listening on gRPC
-2. ScriptHost.InitializeAsync() → GetFunctionsMetadata()
-3.   → FunctionMetadataProvider.GetFunctionMetadataAsync()
-4.     → [CanWorkerIndex() == true]
-5.       → ConnectedWorkerFunctionMetadataProvider.GetFunctionMetadataAsync()
-6.         → _channelManager.WaitForChannelAsync()       ← BLOCKS here (no process spawn)
-7. External worker connects inbound to gRPC
-8.   → FunctionRpcService detects unknown workerId
-9.   → WorkerConnectionService.NotifyInboundConnection()
-10.  → ConnectedWorkerChannel created, init handshake completes
-11.  → ConnectedWorkerChannelManager.AddChannel() signals TCS
-12. WaitForChannelAsync() returns the channel              ← UNBLOCKS
-13.  → channel.GetFunctionMetadata()                       ← standard RPC
-14. Metadata flows back through FunctionMetadataManager
-15. ScriptHost.InitializeFunctionDescriptorsAsync()
-16. ScriptHost.GenerateFunctions() → ScriptTypeLocator.SetTypes()
-17. ConnectedWorkerInvocationDispatcher ready for invocations
+Infrastructure                     Runtime                                Worker Pod
+      |                              |                                        |
+      |-- POST /admin/instance/      |                                        |
+      |   specialize {appContext} --->|                                        |
+      |                              |-- ApplyAppSettings()                   |
+      |                              |-- RestartHostAsync()                   |
+      |                              |-- ConfigureAppConfiguration            |
+      |                              |     ExternalWorkerHostJsonConfig       |
+      |                              |     .Load() → BLOCKS                   |
+      |                              |                                        |
+      |-- (start worker pod) --------|--------------------------------------->|
+      |   (wait for IP)              |                                        |
+      |                              |                                        |
+      |-- POST /admin/workers/       |                                        |
+      |   assign {workerId,          |                                        |
+      |    grpcEndpoint} ----------->|                                        |
+      |                              |-- OutboundGrpcClient.ConnectAsync() -->|
+      |                              |-- ConnectedWorkerChannel               |
+      |                              |   .StartWorkerProcessAsync()           |
+      |                              |                                        |
+      |                              |<-- StartStream {host_config_json} -----|
+      |                              |-- SetContent(json) → UNBLOCKS Load()   |
+      |                              |-- WorkerInitRequest ------------------>|
+      |                              |<-- WorkerInitResponse -----------------|
+      |                              |-- WorkerConnectedEvent                 |
+      |                              |-- AddChannel(workerId)                 |
+      |                              |-- WaitForChannelAsync() UNBLOCKS       |
+      |                              |-- GetFunctionMetadata() -------------->|
+      |                              |<-- metadata ---------------------------|
+      |                              |-- Functions loaded, triggers started   |
+      |                              |                                        |
+      |   [SCALE OUT — new worker]   |                                        |
+      |-- POST /admin/workers/       |                                   ┌────────────┐
+      |   assign {workerId2,         |                                   │ Worker     │
+      |    grpcEndpoint2} ---------->|                                   │ Pod 2      │
+      |                              |-- OutboundGrpcClient #2 -------->│            │
+      |                              |-- handshake, SetupChannel()      │            │
+      |                              |-- round-robin now includes #2    └────────────┘
 ```
+
+### Why a separate API instead of extending `/admin/instance/assign`?
+
+1. **Temporal decoupling** — app context is available before workers are. Merging them would either delay specialization or require a partial-then-complete pattern.
+2. **Multiple workers** — `/admin/workers/assign` is called per-worker. Mixing worker connection info into the app assignment model doesn't scale.
+3. **Independent lifecycle** — workers can be added/removed without re-assigning the app. Future scale-in would use a `DELETE /admin/workers/{workerId}` endpoint.
+4. **Clean separation of concerns** — the runtime's specialization flow stays close to today's; worker connectivity is a new capability layered on top.
 
 ### Design notes
 
-- **Timeout**: 2 minutes matches `ScriptTypeLocator._setWaitTimeout` — if no worker connects in time, the host fails to start with a clear error.
-- **Validation sharing**: `ValidateMetadata()` logic should ideally be extracted from `WorkerFunctionMetadataProvider` into a shared static helper to avoid duplication. This is a low-risk refactor.
-- **`FunctionMetadataProvider` unchanged**: The outer orchestrator that decides between worker vs host indexing is not modified.
-- **`WorkerFunctionMetadataProvider` unchanged**: The existing process-spawning provider is not modified — the DI swap selects which implementation is active.
+- **Auth**: Both APIs use the existing `AdminAuthLevel` policy. Infrastructure authenticates the same way it does today for `/admin/instance/assign`.
+- **`/admin/instance/specialize` vs `/admin/instance/assign`**: For preview, we can reuse the existing assign endpoint with a flag or config that changes behavior. A separate endpoint is cleaner long-term but not strictly necessary for preview.
+- **`ExternalWorkerOptions`**: `GrpcEndpoint` is no longer set via config — it arrives dynamically via API. The options class keeps `IsEnabled` and `AllowedLanguages` but the endpoint is per-worker.
+- **Error handling**: If the gRPC connection fails, the API returns `502 Bad Gateway`. The channel manager doesn't register the channel, and infrastructure can retry.
+- **Graceful removal**: Future milestone adds `DELETE /admin/workers/{workerId}` for scale-in. `WorkerConnectionService.DisconnectWorkerAsync()` drains invocations, disposes the channel and client.
 
 ---
 
-## M3: Inbound Connection Acceptance
-
-### Modified: `FunctionRpcService.cs`
-
-The current `EventStream` handler (line 54) rejects unknown `workerId`s silently. We add a branch:
-
-```csharp
-// Current code at line 54:
-if (!string.IsNullOrEmpty(workerId) && _eventManager.TryGetGrpcChannels(workerId, out var inbound, out var outbound))
-{
-    // existing path — host-managed workers
-}
-
-// NEW: after the existing block (i.e., else branch for unknown workerIds):
-else if (!string.IsNullOrEmpty(workerId) && _externalWorkerOptions.Value.IsEnabled)
-{
-    // Worker is connecting inbound. Create gRPC channels on-the-fly for this workerId.
-    _eventManager.AddGrpcChannels(workerId);
-    if (_eventManager.TryGetGrpcChannels(workerId, out inbound, out outbound))
-    {
-        // Notify the channel factory that a new inbound worker is connecting
-        _workerConnectionService.NotifyInboundConnection(workerId);
-
-        // Run outbound push in background
-        _ = PushFromOutboundToGrpc(workerId, responseStream, outbound.Reader, cts.Token);
-
-        // Inbound pull loop (same as existing path)
-        do
-        {
-            // ... identical pull loop
-        }
-        while (await await MoveNextAsync(requestStream, cancelSource));
-    }
-}
-```
-
-**Constructor addition** (inject `IOptions<ExternalWorkerOptions>`, `WorkerConnectionService`, and `HostJsonContentProvider`):
-
-```csharp
-public FunctionRpcService(
-    IScriptEventManager eventManager,
-    ILogger<FunctionRpcService> logger,
-    IOptions<ExternalWorkerOptions> externalWorkerOptions = null,      // optional — null when feature disabled
-    WorkerConnectionService workerConnectionService = null,            // optional
-    HostJsonContentProvider hostJsonContentProvider = null)             // optional — for host.json delivery
-{
-    _eventManager = eventManager;
-    _logger = logger;
-    _externalWorkerOptions = externalWorkerOptions;
-    _workerConnectionService = workerConnectionService;
-    _hostJsonContentProvider = hostJsonContentProvider;
-}
-```
-
-> Using optional parameters keeps the existing DI registration valid when external worker support is not added. When `AddExternalWorkerSupport()` is called, the full constructor is used.
-
-In the external worker branch of `EventStream`, intercept host.json from the first `StartStream` message (see M3b for details):
-
-```csharp
-// NEW: after reading the first StartStream message for an external worker:
-if (_hostJsonContentProvider is not null
-    && !string.IsNullOrEmpty(currentMessage.StartStream?.HostConfigurationJson))
-{
-    _hostJsonContentProvider.SetContent(currentMessage.StartStream.HostConfigurationJson);
-}
-```
-
-### New file: `ExternalWorkers/WorkerConnectedEvent.cs`
-
-```csharp
-namespace Microsoft.Azure.WebJobs.Script.Grpc.ExternalWorkers
-{
-    /// <summary>Published when a connected worker completes the WorkerInitResponse handshake.</summary>
-    public class WorkerConnectedEvent : ScriptEvent
-    {
-        public WorkerConnectedEvent(string workerId, string runtime)
-            : base(nameof(WorkerConnectedEvent), ScriptEvents.HostStarted)
-        {
-            WorkerId = workerId;
-            Runtime = runtime;
-        }
-
-        public string WorkerId { get; }
-        public string Runtime { get; }
-    }
-}
-```
-
-### New file: `ExternalWorkers/WorkerConnectionService.cs`
-
-```csharp
-namespace Microsoft.Azure.WebJobs.Script.Grpc.ExternalWorkers
-{
-    /// <summary>
-    /// Hosted service that responds to inbound worker connections.
-    /// Flow: FunctionRpcService detects new workerId → calls NotifyInboundConnection()
-    ///       → this service creates a ConnectedWorkerChannel and waits for WorkerInitResponse
-    ///       → on WorkerConnectedEvent: calls GetFunctionMetadata() + triggers host (re)init.
-    /// </summary>
-    internal class WorkerConnectionService : IHostedService
-    {
-        private readonly ConnectedWorkerChannelFactory _channelFactory;
-        private readonly IConnectedWorkerChannelManager _channelManager;
-        private readonly IScriptEventManager _eventManager;
-        private readonly IScriptHostManager _scriptHostManager;
-        private readonly IOptions<ExternalWorkerOptions> _options;
-        private readonly ILogger<WorkerConnectionService> _logger;
-        private IDisposable _workerConnectedSubscription;
-
-        public WorkerConnectionService(/* ...DI params... */) { /* store all */ }
-
-        public Task StartAsync(CancellationToken cancellationToken)
-        {
-            _workerConnectedSubscription = _eventManager
-                .OfType<WorkerConnectedEvent>()
-                .Subscribe(OnWorkerConnected);
-            return Task.CompletedTask;
-        }
-
-        public Task StopAsync(CancellationToken cancellationToken)
-        {
-            _workerConnectedSubscription?.Dispose();
-            return Task.CompletedTask;
-        }
-
-        /// <summary>Called by FunctionRpcService when an unknown workerId appears on StartStream.</summary>
-        public void NotifyInboundConnection(string workerId)
-        {
-            // Create channel; it will process the StartStream callback itself
-            // (BeginInboundProcessing is called inside StartWorkerProcessAsync)
-            var workerConfig = BuildWorkerConfig(workerId);
-            var channel = _channelFactory.Create(workerId, workerConfig);
-
-            // Channel now listens for StartStream → WorkerInitRequest → WorkerInitResponse
-            _ = channel.StartWorkerProcessAsync(CancellationToken.None);
-        }
-
-        private void OnWorkerConnected(WorkerConnectedEvent evt)
-        {
-            // Channel finished init — register it and trigger function loading
-            var channel = _channelFactory.GetCreatedChannel(evt.WorkerId); // factory tracks pending channels
-            if (channel is null) return;
-
-            _channelManager.AddChannel(evt.WorkerId, channel);
-
-            // Trigger host (re)initialization so GetFunctionMetadata() is called
-            _ = _scriptHostManager.RestartHostAsync($"External worker connected: {evt.WorkerId}");
-        }
-
-        private RpcWorkerConfig BuildWorkerConfig(string workerId)
-        {
-            // Build a minimal RpcWorkerConfig based on ExternalWorkerOptions (allowed language, etc.)
-            // Details depend on what language info is provided with the connection.
-            // For preview: a single generic config is acceptable.
-            var language = _options.Value.AllowedLanguages?.FirstOrDefault() ?? "unknown";
-            return RpcWorkerConfigFactory.CreateMinimal(language);
-        }
-    }
-}
-```
-
-**Note on `WorkerConnectedEvent` publishing**: The base class `WorkerChannelBase.WorkerInitResponse()` already fires init-complete logic. We add a publish:
-
-```csharp
-// In WorkerChannelBase.WorkerInitResponse() — ONLY when running as ConnectedWorkerChannel:
-// Option A: override WorkerInitResponse in ConnectedWorkerChannel to also publish the event
-// Option B: base class publishes if IsExternalWorker property is true (cleaner)
-
-// Chosen approach: override in ConnectedWorkerChannel
-internal override void WorkerInitResponse(GrpcEvent initEvent)
-{
-    base.WorkerInitResponse(initEvent);
-    _eventManager.Publish(new WorkerConnectedEvent(_workerId, _runtime));
-}
-```
-
----
-
-## M3b: host.json Delivery via gRPC
-
-### Problem: host has no access to customer payload
-
-In the separated compute model, the customer's application files (including `host.json`) live in the worker's container. The host cannot read them from disk. However, `host.json` drives critical host configuration: extension settings, logging, function timeouts, health monitoring, HTTP routing, etc.
-
-Today, `HostJsonFileConfigurationSource` reads `host.json` from `ScriptPath` during `ConfigureAppConfiguration`. All downstream option bindings (`ScriptJobHostOptions`, `HostHealthMonitorOptions`, extension configs, etc.) flow from this single configuration source.
-
-### Why blocking in `ConfigureAppConfiguration` works
-
-The gRPC server starts at the **WebHost level** (via `RpcInitializationService`, registered as `IManagedHostedService`) **before** the ScriptHost is built:
-
-```
-WebHost starts hosted services (in registration order):
-  1. RpcInitializationService.StartAsync() → gRPC server listening ✅
-  2. WebJobsScriptHostService.StartAsync() → builds ScriptHost
-       → ConfigureAppConfiguration runs    ← gRPC already available
-       → IConfigurationProvider.Load()     ← can block here safely
-```
-
-Since `IConfigurationProvider.Load()` is synchronous and runs on the `WebJobsScriptHostService` thread, while gRPC requests are handled on Kestrel's thread pool, a blocking wait does not deadlock.
-
-### Proto change: add `host_configuration_json` to `StartStream`
-
-```protobuf
-message StartStream {
-  string worker_id = 2;
-
-  // Raw host.json content from the worker's filesystem.
-  // Sent by external workers in separated compute scenarios.
-  // Ignored by the host when external worker mode is disabled.
-  string host_configuration_json = 3;
-}
-```
-
-`StartStream` is the natural location because:
-- It is always the first message sent by a worker
-- `FunctionRpcService` already reads it to extract `workerId`
-- No channel infrastructure is needed — the interception happens at the relay level
-- host.json content is available immediately, before any channel or handshake processing
-
-### New file: `ExternalWorkers/HostJsonContentProvider.cs`
-
-```csharp
-namespace Microsoft.Azure.WebJobs.Script.Grpc.ExternalWorkers
-{
-    /// <summary>
-    /// WebHost-level singleton that bridges gRPC (where the worker sends host.json)
-    /// and the ScriptHost configuration pipeline (where host.json is consumed).
-    ///
-    /// Lifecycle:
-    /// - FunctionRpcService calls SetContent() when an external worker's StartStream
-    ///   includes host_configuration_json.
-    /// - ExternalWorkerHostJsonConfigurationProvider calls WaitForContent() during
-    ///   ConfigureAppConfiguration, blocking until content is available.
-    /// - On ScriptHost restart, Reset() prepares for the next Build() cycle.
-    ///   If cached content exists (worker still connected), the next Load() returns
-    ///   immediately without blocking.
-    /// </summary>
-    internal class HostJsonContentProvider
-    {
-        private readonly object _lock = new();
-        private TaskCompletionSource<string> _tcs = new();
-        private string _cachedContent;
-
-        /// <summary>
-        /// Called by FunctionRpcService when an external worker provides host.json.
-        /// </summary>
-        public void SetContent(string hostJsonContent)
-        {
-            lock (_lock)
-            {
-                _cachedContent = hostJsonContent;
-                _tcs.TrySetResult(hostJsonContent);
-            }
-        }
-
-        /// <summary>
-        /// Called on ScriptHost restart (via ActiveHostChanged event).
-        /// Prepares a fresh TCS for the next ConfigureAppConfiguration cycle.
-        /// If cached content exists, the next Load() completes immediately.
-        /// </summary>
-        /// <param name="clearCache">
-        /// True when the worker has disconnected and we must wait for a new worker.
-        /// False on a normal ScriptHost restart where the worker is still connected.
-        /// </param>
-        public void Reset(bool clearCache = false)
-        {
-            lock (_lock)
-            {
-                if (clearCache)
-                {
-                    _cachedContent = null;
-                }
-
-                _tcs = new TaskCompletionSource<string>();
-
-                if (_cachedContent is not null)
-                {
-                    _tcs.TrySetResult(_cachedContent);
-                }
-            }
-        }
-
-        /// <summary>
-        /// Synchronous blocking wait used by ExternalWorkerHostJsonConfigurationProvider.Load().
-        /// Safe because gRPC is already listening on a separate Kestrel instance and the
-        /// worker connection is handled on Kestrel's thread pool.
-        /// </summary>
-        public string WaitForContent(TimeSpan timeout)
-        {
-            if (_tcs.Task.Wait(timeout))
-            {
-                return _tcs.Task.Result;
-            }
-
-            throw new TimeoutException(
-                $"No external worker provided host.json within {timeout.TotalSeconds} seconds. "
-                + "Ensure the worker container is running and configured to connect to this host.");
-        }
-    }
-}
-```
-
-### New file: `ExternalWorkers/ExternalWorkerHostJsonConfigurationSource.cs`
-
-```csharp
-namespace Microsoft.Azure.WebJobs.Script.Grpc.ExternalWorkers
-{
-    /// <summary>
-    /// IConfigurationSource that replaces HostJsonFileConfigurationSource in external worker mode.
-    /// Instead of reading host.json from disk, blocks until a connected worker provides the
-    /// content via gRPC, then parses it identically to HostJsonFileConfigurationSource.
-    /// </summary>
-    internal class ExternalWorkerHostJsonConfigurationSource : IConfigurationSource
-    {
-        private readonly HostJsonContentProvider _contentProvider;
-        private readonly ILogger _logger;
-
-        public ExternalWorkerHostJsonConfigurationSource(
-            HostJsonContentProvider contentProvider,
-            ILogger logger)
-        {
-            _contentProvider = contentProvider;
-            _logger = logger;
-        }
-
-        public IConfigurationProvider Build(IConfigurationBuilder builder)
-        {
-            return new ExternalWorkerHostJsonConfigurationProvider(_contentProvider, _logger);
-        }
-    }
-
-    internal class ExternalWorkerHostJsonConfigurationProvider : ConfigurationProvider
-    {
-        private static readonly TimeSpan DefaultTimeout = TimeSpan.FromMinutes(2);
-        private readonly HostJsonContentProvider _contentProvider;
-        private readonly ILogger _logger;
-
-        public ExternalWorkerHostJsonConfigurationProvider(
-            HostJsonContentProvider contentProvider,
-            ILogger logger)
-        {
-            _contentProvider = contentProvider;
-            _logger = logger;
-        }
-
-        public override void Load()
-        {
-            _logger.LogInformation(
-                "Waiting for external worker to provide host.json via gRPC...");
-
-            string hostJson = _contentProvider.WaitForContent(DefaultTimeout);
-
-            _logger.LogInformation(
-                "Received host.json from external worker ({length} bytes). Applying configuration.",
-                hostJson.Length);
-
-            // Parse using the same logic as HostJsonFileConfigurationSource:
-            // 1. Parse JSON
-            // 2. Validate "version" == "2.0"
-            // 3. Flatten into the AzureFunctionsJobHost configuration section
-            // 4. Populate the Data dictionary
-            //
-            // Implementation should reuse or mirror HostJsonFileConfigurationSource.LoadHostConfig()
-            // to ensure identical configuration key paths.
-            var hostConfig = JObject.Parse(hostJson);
-            ApplyHostJsonToConfiguration(hostConfig);
-        }
-
-        private void ApplyHostJsonToConfiguration(JObject hostConfig)
-        {
-            // Mirror HostJsonFileConfigurationSource parsing:
-            // - Validates version field
-            // - Flattens JSON into "AzureFunctionsJobHost:key" configuration keys
-            // - Handles well-known sections: extensions, logging, http, queues, etc.
-            // (Implementation detail — follows the same structure as
-            //  HostJsonFileConfigurationSource.LoadHostConfigurationFile)
-        }
-    }
-}
-```
-
-### Modified: `ScriptHostBuilderExtensions.cs`
-
-In `ConfigureAppConfiguration`, conditionally swap the configuration source:
-
-```csharp
-.ConfigureAppConfiguration((context, configBuilder) =>
-{
-    if (!context.Properties.ContainsKey(ScriptConstants.SkipHostJsonConfigurationKey))
-    {
-        // NEW: check if external workers are enabled
-        if (hostJsonContentProvider is not null)
-        {
-            // External worker mode: block until worker provides host.json via gRPC
-            configBuilder.Add(new ExternalWorkerHostJsonConfigurationSource(
-                hostJsonContentProvider, loggerFactory.CreateLogger("HostJsonConfig")));
-        }
-        else
-        {
-            // Standard mode: read host.json from disk
-            HostJsonFileConfigurationOptions hostJsonConfigOptions =
-                new(SystemEnvironment.Instance, applicationOptions);
-            configBuilder.Add(new HostJsonFileConfigurationSource(
-                hostJsonConfigOptions, loggerFactory, metricsLogger));
-        }
-    }
-})
-```
-
-The `hostJsonContentProvider` reference is passed into the ScriptHost builder from the WebHost level — the same way `ScriptApplicationHostOptions` is passed today.
-
-### Restart handling via `ActiveHostChanged`
-
-`HostJsonContentProvider` is a WebHost-level singleton that outlives ScriptHost restarts. On each restart, `WebJobsScriptHostService` builds a new ScriptHost, which runs `ConfigureAppConfiguration` → `Load()` again.
-
-Subscribe to `IScriptHostManager.ActiveHostChanged` to reset the provider:
-
-```csharp
-// In WebHost-level service registration or HostJsonContentProvider initialization:
-scriptHostManager.ActiveHostChanged += (_, e) =>
-{
-    if (e.NewHost is null)
-    {
-        // ScriptHost is being torn down for restart.
-        // Reset the TCS for the next Build() cycle.
-        // Keep cached content — if the worker is still connected,
-        // the next Load() returns immediately without blocking.
-        hostJsonContentProvider.Reset();
-    }
-};
-```
-
-When the worker disconnects, `WorkerConnectionService` calls `Reset(clearCache: true)` so the next restart blocks until a new worker provides fresh host.json:
-
-```csharp
-// In WorkerConnectionService, on worker disconnect:
-private void OnWorkerDisconnected(string workerId)
-{
-    _hostJsonContentProvider.Reset(clearCache: true);
-    // ... channel cleanup ...
-}
-```
-
-### Restart scenarios
-
-| Scenario | HostJsonContentProvider state | Next `Load()` behavior |
-|---|---|---|
-| ScriptHost restarts, worker still connected | `Reset()` — cache preserved | Returns immediately (no blocking) |
-| Worker disconnects, then ScriptHost restarts | `Reset(clearCache: true)` — cache cleared | Blocks until new worker connects |
-| Worker reconnects with new host.json | `SetContent(newJson)` — cache updated | Next restart uses new content |
-| Specialization (placeholder → app) | `ActiveHostChanged` → `Reset()` | Returns from cache or blocks |
-
-### Full timeline
-
-```
-T0  WebHost starts
-T1  RpcInitializationService.StartAsync() → gRPC listening on port N
-T2  WebJobsScriptHostService.StartAsync() → starts building ScriptHost
-T3    ConfigureAppConfiguration
-T4      ExternalWorkerHostJsonConfigurationProvider.Load() → BLOCKS on WaitForContent()
-          ↕ (meanwhile, on gRPC Kestrel thread pool)
-T5      Worker connects → StartStream { worker_id: "w_abc123", host_configuration_json: "{...}" }
-T6      FunctionRpcService reads StartStream → _hostJsonContentProvider.SetContent(json)
-T7    Load() UNBLOCKS → parses host.json → configuration pipeline continues
-T8    ScriptHost services configured with correct host.json values
-T9  ScriptHost.StartAsync() → InitializeAsync()
-T10   ConnectedWorkerFunctionMetadataProvider.WaitForChannelAsync() → BLOCKS
-        ↕ (channel handshake continues on gRPC thread)
-T11   WorkerInitRequest → WorkerInitResponse → channel ready
-T12   ConnectedWorkerChannelManager.AddChannel() → signals TCS
-T13 WaitForChannelAsync() UNBLOCKS → channel.GetFunctionMetadata()
-T14 Metadata → InitializeFunctionDescriptors → GenerateFunctions → SetTypes
-T15 Host fully initialized, triggers ready, invocations flow
-```
-
----
-
-## M4: Configuration & DI
-
-### New file: `ExternalWorkers/ExternalWorkerOptions.cs`
-
-```csharp
-namespace Microsoft.Azure.WebJobs.Script.Grpc.ExternalWorkers
-{
-    public class ExternalWorkerOptions
-    {
-        public bool IsEnabled { get; set; }
-        public IList<string> AllowedLanguages { get; set; } = new List<string>();
-    }
-}
-```
-
-**Config key** (via `appsettings.json` or environment):
-```
-AzureFunctionsJobHost:Workers:ExternalWorkers:Enabled = true
-AzureFunctionsJobHost:Workers:ExternalWorkers:AllowedLanguages:0 = node
-```
-
-### New file: `ExternalWorkers/ExternalWorkerServiceCollectionExtensions.cs`
-
-```csharp
-namespace Microsoft.Azure.WebJobs.Script.Grpc.ExternalWorkers
-{
-    public static class ExternalWorkerServiceCollectionExtensions
-    {
-        public static IServiceCollection AddExternalWorkerSupport(
-            this IServiceCollection services,
-            IConfiguration configuration)
-        {
-            services.Configure<ExternalWorkerOptions>(
-                configuration.GetSection("AzureFunctionsJobHost:Workers:ExternalWorkers"));
-
-            // host.json delivery — WebHost-level singleton shared between gRPC and ScriptHost config
-            services.AddSingleton<HostJsonContentProvider>();
-
-            services.AddSingleton<ConnectedWorkerChannelFactory>();
-            services.AddSingleton<IConnectedWorkerChannelManager, ConnectedWorkerChannelManager>();
-            services.AddSingleton<WorkerConnectionService>();
-            services.AddHostedService(sp => sp.GetRequiredService<WorkerConnectionService>());
-
-            // Replace the default IFunctionInvocationDispatcher with one that routes to connected channels
-            services.AddSingleton<IFunctionInvocationDispatcher, ConnectedWorkerInvocationDispatcher>();
-
-            // Replace the default IWorkerFunctionMetadataProvider so metadata retrieval
-            // waits for an inbound worker connection instead of spawning a process.
-            // Must be registered BEFORE the TryAddSingleton in RpcServiceCollectionExtensions to win.
-            services.AddSingleton<IWorkerFunctionMetadataProvider, ConnectedWorkerFunctionMetadataProvider>();
-
-            return services;
-        }
-    }
-}
-```
-
-**Called from** `WebScriptHostBuilderExtension.cs` (or `Startup.cs`) conditionally:
-
-```csharp
-// In WebScriptHostBuilderExtension.AddWebJobsScriptHost() or similar
-var externalWorkerConfig = context.Configuration.GetSection("AzureFunctionsJobHost:Workers:ExternalWorkers");
-if (externalWorkerConfig.GetValue<bool>("Enabled"))
-{
-    services.AddExternalWorkerSupport(context.Configuration);
-}
-```
-
-### Trigger readiness gate
-
-Before external workers connect, the host must not start trigger listeners. This is handled in the existing `ScriptHost` startup via `IFunctionInvocationDispatcher.State`. `ConnectedWorkerInvocationDispatcher` returns `Initializing` state until at least one channel is ready:
-
-```csharp
-public FunctionInvocationDispatcherState State
-{
-    get
-    {
-        bool anyReady = _channelManager.GetChannels().Values
-            .Any(c => c.IsChannelReadyForInvocations());
-        return anyReady
-            ? FunctionInvocationDispatcherState.Initialized
-            : FunctionInvocationDispatcherState.Initializing;
-    }
-}
-```
-
----
-
-## M4b: Placeholder Mode Support
+## M4 Placeholder: Placeholder Mode Support
 
 ### Background
 
@@ -1446,46 +1166,49 @@ PLACEHOLDER PHASE (no worker present)
 ──────────────────────────────────────
 T0   WebHost starts
 T1   RpcInitializationService.StartAsync()
-       → gRPC server listening ✅
+       → gRPC server listening (host-managed workers) ✅
        → InitializeChannelsAsync() → SKIPPED (external worker mode)
-T2   WebJobsScriptHostService.StartAsync() → builds placeholder ScriptHost
+T2   WorkerConnectionService.StartAsync()
+       → external workers disabled during placeholder → no outbound connection
+T3   WebJobsScriptHostService.StartAsync() → builds placeholder ScriptHost
        → ConfigureAppConfiguration
        → ExternalWorkerHostJsonConfigurationSource.Load()
        → placeholder mode detected → returns default config (no blocking)
-T3   StandbyInitializationService → creates synthetic WarmUp function + specialization timer
-T4   Placeholder ScriptHost starts with synthetic WarmUp function
-T5   Warmup request arrives (/api/WarmUp)
+T4   StandbyInitializationService → creates synthetic WarmUp function + specialization timer
+T5   Placeholder ScriptHost starts with synthetic WarmUp function
+T6   Warmup request arrives (/api/WarmUp)
        → PreJitPrepare(coldstart.jittrace) ✅
        → ReadRuntimeAssemblyFiles() ✅
        → WorkerWarmupAsync() → no channels → no-op ✅
-T6   Host is warm, waiting for specialization
+T7   Host is warm, waiting for specialization
 
-SPECIALIZATION PHASE (worker connects)
-──────────────────────────────────────
-T7   Environment variables change (real app assigned)
-T8   PlaceholderSpecializationMiddleware detects: !InStandbyMode && IsContainerReady()
-T9   StandbyManager.SpecializeHostCoreAsync()
+SPECIALIZATION PHASE (worker connects via outbound gRPC)
+─────────────────────────────────────────────────────────
+T8   Environment variables change (real app assigned, gRPC endpoint available)
+T9   PlaceholderSpecializationMiddleware detects: !InStandbyMode && IsContainerReady()
+T10  StandbyManager.SpecializeHostCoreAsync()
        → _configuration.Reload()
        → _hostNameProvider.Reset()
        → NotifyChange() (signals StandbyChangeTokenSource)
        → _workerManager.SpecializeAsync() → no channels → quick return
        → _scriptHostManager.RestartHostAsync("Host specialization.")
-T10  Old placeholder ScriptHost torn down
-T11  New ScriptHost builds
+T11  Old placeholder ScriptHost torn down
+T12  WorkerConnectionService detects specialization → initiates outbound gRPC connection
+T13  New ScriptHost builds
        → ConfigureAppConfiguration
        → ExternalWorkerHostJsonConfigurationSource.Load()
        → NOT in placeholder mode → BLOCKS on WaitForContent()
-           ↕ (meanwhile, on gRPC Kestrel thread pool)
-T12  External worker connects → StartStream { worker_id, host_configuration_json }
-T13  FunctionRpcService → HostJsonContentProvider.SetContent(json)
-T14  Load() UNBLOCKS → real host.json applied → configuration pipeline continues
-T15  ScriptHost services configured with real host.json values
-T16  ScriptHost.InitializeAsync()
+           ↕ (meanwhile, outbound gRPC active)
+T14  Worker sends StartStream { worker_id, host_configuration_json } → relayed to runtime
+T15  ConnectedWorkerChannel intercepts host.json → HostJsonContentProvider.SetContent(json)
+T16  Load() UNBLOCKS → real host.json applied → configuration pipeline continues
+T17  ScriptHost services configured with real host.json values
+T18  ScriptHost.InitializeAsync()
        → ConnectedWorkerFunctionMetadataProvider.WaitForChannelAsync()
        → channel handshake completes → metadata retrieved
-T17  Functions loaded → triggers started → host fully ready
-T18  _scriptHostManager.DelayUntilHostReadyAsync() returns
-T19  App serving traffic
+T19  Functions loaded → triggers started → host fully ready
+T20  _scriptHostManager.DelayUntilHostReadyAsync() returns
+T21  App serving traffic
 ```
 
 ### What does NOT need mocking
@@ -1527,7 +1250,7 @@ Key prototype patterns that inform our implementation:
 | Prototype | Our implementation |
 |---|---|
 | `w_{8-char-guid}` worker ID from `DefaultWorkerController` | Same format, assigned by external orchestrator |
-| `SidecarRpcService` bidirectional relay — stream already exists when worker connects | `FunctionRpcService` branch for unknown `workerId` |
+| `SidecarRpcService` bidirectional relay — stream already exists when worker connects | Outbound `OutboundGrpcClient` connects to remote endpoint; `FunctionRpcService` unchanged |
 | `WorkerConnect` consolidated message (type 50 in proto) | **Not used for preview** — standard init sequence is sufficient |
 | `WorkerState.FunctionMetadata` collected during placeholder phase | `GetFunctionMetadata()` RPC called post `WorkerInitResponse` |
 | `SpecializationOrchestrator` triggers host reload | `WorkerConnectionService.OnWorkerConnected()` calls `RestartHostAsync()` |
@@ -1543,8 +1266,10 @@ The `WorkerConnect`/`WorkerConnectResponse` proto messages (types 50/51) defined
 3. **Zero changes to `WorkerFunctionMetadataProvider`** — the existing process-spawning metadata provider is unchanged; `ConnectedWorkerFunctionMetadataProvider` is a parallel implementation swapped via DI.
 4. **Zero changes to `FunctionMetadataProvider`** — the outer orchestrator (worker vs host indexing decision) is unchanged.
 5. **Zero changes to `HostJsonFileConfigurationSource`** — the existing file-based config source is unchanged; `ExternalWorkerHostJsonConfigurationSource` is a parallel implementation swapped conditionally in `ConfigureAppConfiguration`.
-6. **`FunctionRpcService` changes are branch-only** — existing path for known `workerId`s is unmodified.
+6. **Zero changes to `FunctionRpcService`** — external workers connect via `OutboundGrpcClient`; `FunctionRpcService` continues to serve only host-managed workers.
 7. **`WorkerChannelBase` is a pure refactor** — all existing tests pass without modification (GrpcWorkerChannel behavior is identical).
 8. **External worker mode requires explicit opt-in** — `ExternalWorkers:Enabled = true` in config; no impact on existing deployments.
-9. **gRPC server startup order is unchanged** — `RpcInitializationService` starts at WebHost level before ScriptHost is built; external worker mode relies on this existing ordering.
+9. **gRPC server startup order is unchanged** — `RpcInitializationService` starts at WebHost level before ScriptHost is built; `WorkerConnectionService` starts outbound connection at WebHost level in the same phase.
 10. **Placeholder warmup runs identically** — JIT trace, assembly page-in, and synthetic WarmUp function are unchanged. Worker-dependent warmup steps are already graceful no-ops when no channels exist.
+11. **Zero changes to worker protocol** — Workers connect to their configured endpoint using the same `FunctionRpc.EventStream` RPC. The transport topology is transparent to the worker.
+12. **Runtime is transport-agnostic** — It connects outbound to a configured gRPC endpoint via `OutboundGrpcClient`. It does not know or care whether the other end is a sidecar relay, a direct worker, or any other topology.
